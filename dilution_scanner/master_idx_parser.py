@@ -28,14 +28,23 @@ def parse_master_idx(text: str) -> List[MasterIdxRow]:
     lines = text.splitlines()
 
     header_idx = -1
-    header = "CIK|Company Name|Form Type|Date Filed|Filename"
     for i, line in enumerate(lines):
-        if line.strip() == header:
+        s = line.strip()
+        # Deterministic header detection: must be pipe-delimited and include these tokens
+        if (
+            "CIK" in s
+            and "Company" in s
+            and "Form" in s
+            and "Date" in s
+            and "Filename" in s
+            and "|" in s
+        ):
             header_idx = i
             break
 
     if header_idx == -1:
         raise ValueError("master.idx header line not found")
+
 
     rows: List[MasterIdxRow] = []
     for line in lines[header_idx + 1 :]:
