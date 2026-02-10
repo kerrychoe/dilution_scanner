@@ -16,7 +16,7 @@ ALLOWED_FORMS = [
 ]
 
 # SEC requires a descriptive User-Agent (include email)
-SEC_USER_AGENT = "DilutionTickerScanner/1.0 (contact: you@example.com)"
+SEC_USER_AGENT = "DilutionTickerScanner/1.0 (contact: kerrychoe@gmail.com)"
 
 def ensure_output_dir():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
