@@ -3,6 +3,7 @@ import json
 import time
 import requests
 from datetime import datetime, timedelta, timezone
+from dilution_scanner.master_idx_parser import parse_master_idx
 
 OUTPUT_DIR = "output"
 
@@ -104,6 +105,7 @@ def main():
     fetch_ok = False
     fetched_bytes_len = 0
     error = None
+    parsed_row_count = 0
 
     try:
         resp = sec_get(url)
@@ -124,8 +126,14 @@ def main():
         if resp.status_code == 200 and fetched_bytes_len > 0:
             write_file_bytes(f"{OUTPUT_DIR}/master.idx", content)
             fetch_ok = True
+        
+            text = content.decode("latin-1")
+            parsed_rows = parse_master_idx(text)
+            parsed_row_count = len(parsed_rows)
         else:
             error = f"Non-200 or empty body (status={resp.status_code}, bytes={fetched_bytes_len})"
+            parsed_row_count = 0
+
     except Exception as e:
         error = str(e)
 
@@ -145,6 +153,7 @@ def main():
         "date_mode": date_mode,
         "allowed_forms": ALLOWED_FORMS,
         "sec_user_agent": SEC_USER_AGENT,
+        "master_idx_parsed_rows": parsed_row_count,        
         "master_idx_fetch": {
             "date": target_date,
             "url": url,
