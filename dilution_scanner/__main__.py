@@ -88,7 +88,7 @@ def master_idx_url_for_date(date_iso: str) -> str:
     m = int(month)
     qtr = (m - 1) // 3 + 1
     yyyymmdd = f"{year}{month}{day}"
-    return f"https://www.sec.gov/Archives/edgar/daily-index/{y}/QTR{qtr}/master.{yyyymmdd}.idx"
+        return f"https://data.sec.gov/Archives/edgar/daily-index/{y}/QTR{qtr}/master.{yyyymmdd}.idx"
 
 def main():
     ensure_output_dir()
