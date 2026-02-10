@@ -47,12 +47,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: dilution_outputs
-          path: |
-            output/dilution_tickers_verbose.csv
-            output/dilution_tickers.csv
-            output/dilution_tickers_all.csv
-            output/audit_log.json
-            output/run_metadata.json
+          path: output/**
           if-no-files-found: error
 
       - name: Commit updated master list
