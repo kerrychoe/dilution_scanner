@@ -112,6 +112,14 @@ def main():
         if resp.status_code != 200:
             # Save body for debugging (deterministic)
             write_file_bytes(f"{OUTPUT_DIR}/master_idx_error_body.bin", content)
+            # Also save a UTF-8 preview (first 2000 chars) for easy inspection
+            try:
+                preview = content.decode("utf-8", errors="replace")
+            except Exception:
+                preview = "<decode_failed>"
+
+            preview = preview[:2000]
+            write_file_text(f"{OUTPUT_DIR}/master_idx_error_body.txt", preview)
         fetched_bytes_len = len(content)
         if resp.status_code == 200 and fetched_bytes_len > 0:
             write_file_bytes(f"{OUTPUT_DIR}/master.idx", content)
@@ -145,6 +153,7 @@ def main():
             "bytes": fetched_bytes_len,
             "error": error,
             "saved_path": "output/master.idx" if fetch_ok else None,
+            "error_body_preview_path": "output/master_idx_error_body.txt" if not fetch_ok else None,            
         },
         "status": "step13_master_idx_fetch",
     }
