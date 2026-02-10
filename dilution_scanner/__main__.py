@@ -1,5 +1,7 @@
 import os
 import json
+import time
+import requests
 from datetime import datetime, timedelta, timezone
 
 OUTPUT_DIR = "output"
@@ -12,6 +14,9 @@ ALLOWED_FORMS = [
     "F-3",
     "8-K",
 ]
+
+# SEC requires a descriptive User-Agent (include email)
+SEC_USER_AGENT = "DilutionTickerScanner/1.0 (contact: you@example.com)"
 
 def ensure_output_dir():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -35,6 +40,30 @@ def parse_dates():
         mode = "default_yesterday"
 
     return start_date, end_date, mode
+
+def sec_get(url: str, timeout_sec: int = 30) -> requests.Response:
+    """
+    Deterministic SEC GET:
+    - Fixed User-Agent
+    - Basic retry with fixed backoff
+    - No heuristics, no random jitter
+    """
+    headers = {
+        "User-Agent": SEC_USER_AGENT,
+        "Accept-Encoding": "identity",
+    }
+
+    last_exc = None
+    for attempt in range(1, 4):  # 3 attempts max
+        try:
+            resp = requests.get(url, headers=headers, timeout=timeout_sec)
+            return resp
+        except Exception as e:
+            last_exc = e
+            # fixed backoff: 1s, 2s, 3s
+            time.sleep(attempt)
+
+    raise RuntimeError(f"SEC GET failed after 3 attempts: {url}") from last_exc
 
 def main():
     ensure_output_dir()
@@ -60,6 +89,7 @@ def main():
                 "scan_end_date": end_date,
                 "date_mode": date_mode,
                 "allowed_forms": ALLOWED_FORMS,
+                "sec_user_agent": SEC_USER_AGENT,
                 "status": "placeholder",
             },
             indent=2,
@@ -68,6 +98,7 @@ def main():
 
     print(f"Scan window: {start_date} → {end_date} ({date_mode})")
     print(f"Allowed forms: {', '.join(ALLOWED_FORMS)}")
+    print("SEC HTTP helper installed (not used yet).")
     print("Placeholder output files written successfully.")
 
 if __name__ == "__main__":
