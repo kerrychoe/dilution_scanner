@@ -17,6 +17,8 @@ ALLOWED_FORMS = [
 
 # SEC requires a descriptive User-Agent with real contact email
 SEC_USER_AGENT = "DilutionTickerScanner/1.0 (contact: kerrychoe@gmail.com)"
+SEC_CONTACT_EMAIL = "kerrychoe@gmail.com"
+
 
 def ensure_output_dir():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -46,21 +48,34 @@ def parse_dates():
     return start_date, end_date, mode
 
 def sec_get(url: str, timeout_sec: int = 30) -> requests.Response:
+    """
+    Deterministic SEC GET:
+    - Fixed identifying headers (User-Agent + From)
+    - Identity encoding (no compression)
+    - Basic retry with fixed backoff
+    """
     headers = {
         "User-Agent": SEC_USER_AGENT,
+        "From": SEC_CONTACT_EMAIL,
+        "Accept": "text/plain,application/octet-stream,*/*",
+        "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "identity",
+        "Connection": "close",
+        "Referer": "https://www.sec.gov/",
     }
 
     last_exc = None
-    for attempt in range(1, 4):
+    for attempt in range(1, 4):  # 3 attempts max
         try:
             resp = requests.get(url, headers=headers, timeout=timeout_sec)
             return resp
         except Exception as e:
             last_exc = e
+            # fixed backoff: 1s, 2s, 3s
             time.sleep(attempt)
 
     raise RuntimeError(f"SEC GET failed after 3 attempts: {url}") from last_exc
+
 
 def master_idx_url_for_date(date_iso: str) -> str:
     """
@@ -94,6 +109,9 @@ def main():
         resp = sec_get(url)
         fetch_status = resp.status_code
         content = resp.content
+        if resp.status_code != 200:
+            # Save body for debugging (deterministic)
+            write_file_bytes(f"{OUTPUT_DIR}/master_idx_error_body.bin", content)
         fetched_bytes_len = len(content)
         if resp.status_code == 200 and fetched_bytes_len > 0:
             write_file_bytes(f"{OUTPUT_DIR}/master.idx", content)
