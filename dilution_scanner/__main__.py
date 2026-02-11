@@ -150,6 +150,27 @@ def main():
                     allowed_rows.append(r)
 
             allowed_row_count = len(allowed_rows)
+            allowed_filings = []
+            for r in allowed_rows:
+                allowed_filings.append(
+                    {
+                        "cik": r.cik,
+                        "company": r.company,
+                        "form_type": r.form_type,
+                        "date_filed": r.date_filed,
+                        "filename": r.filename,
+                        "index_url": f"https://www.sec.gov/Archives/{r.filename}",
+                    }
+                )
+
+            # Deterministic ordering: sort by form_type, then cik, then filename
+            allowed_filings.sort(key=lambda x: (x["form_type"], x["cik"], x["filename"]))
+
+            write_file_text(
+                f"{OUTPUT_DIR}/allowed_filings.json",
+                json.dumps(allowed_filings, indent=2),
+            )
+
         else:
             error = f"Non-200 or empty body (status={resp.status_code}, bytes={fetched_bytes_len})"
     except Exception as e:
