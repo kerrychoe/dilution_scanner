@@ -1,5 +1,3 @@
-# dilution_scanner/__main__.py
-
 import os
 import json
 import time
@@ -8,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 from dilution_scanner.master_idx_parser import parse_master_idx
 from dilution_scanner.filings import FilingRef, fetch_primary_filing_text, filing_artifact_basename
+from dilution_scanner.rules import scan_filing_text_for_labels
 
 OUTPUT_DIR = "output"
 
@@ -185,7 +184,7 @@ def main():
                 json.dumps(allowed_filings, indent=2),
             )
 
-            # --- Step 23: fetch a tiny deterministic sample of primary filing texts ---
+            # --- Step 23/25/27: fetch a tiny deterministic sample + size cap + rules scan ---
             os.makedirs(f"{OUTPUT_DIR}/filings_raw", exist_ok=True)
 
             allowed_filings_path = f"{OUTPUT_DIR}/allowed_filings.json"
@@ -227,13 +226,18 @@ def main():
                 skipped_due_to_size = False
                 saved_path = None
 
+                labels = []
+                matched_terms = []
+
                 if ok and content_bytes is not None:
                     skipped_due_to_size = bytes_len > MAX_SAMPLE_BYTES
                     if not skipped_due_to_size:
                         write_file_bytes(out_path, content_bytes)
                         saved_path = out_path
+
+                        filing_text = content_bytes.decode("utf-8", errors="replace")
+                        labels, matched_terms = scan_filing_text_for_labels(filing_text)
                     else:
-                        # Explicitly do not write oversized filings
                         saved_path = None
 
                 sample_results.append(
@@ -248,6 +252,8 @@ def main():
                         "http_status": http_status,
                         "bytes": bytes_len,
                         "skipped_due_to_size": skipped_due_to_size,
+                        "labels": labels,
+                        "matched_terms": matched_terms,
                         "error": err_str,
                         "saved_path": saved_path,
                     }
@@ -290,7 +296,7 @@ def main():
             "saved_path": "output/master.idx" if fetch_ok else None,
             "error_body_preview_path": "output/master_idx_error_body.txt" if not fetch_ok else None,
         },
-        "status": "step25_sample_filing_fetch_size_cap",
+        "status": "step27_sample_filing_fetch_rules_scan",
     }
 
     write_file_text(f"{OUTPUT_DIR}/run_metadata.json", json.dumps(run_meta, indent=2))
