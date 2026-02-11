@@ -5,6 +5,7 @@ import requests
 from datetime import datetime, timedelta, timezone
 
 from dilution_scanner.master_idx_parser import parse_master_idx
+from dilution_scanner.filings import FilingRef, fetch_primary_filing_text, filing_artifact_basename
 
 OUTPUT_DIR = "output"
 
@@ -34,6 +35,11 @@ def write_file_bytes(path, content_bytes: bytes):
 def write_file_text(path, content_text: str):
     with open(path, "w", encoding="utf-8") as f:
         f.write(content_text)
+
+
+def read_json_file(path: str):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
 def parse_dates():
@@ -150,6 +156,7 @@ def main():
                     allowed_rows.append(r)
 
             allowed_row_count = len(allowed_rows)
+
             allowed_filings = []
             for r in allowed_rows:
                 allowed_filings.append(
@@ -171,6 +178,56 @@ def main():
                 json.dumps(allowed_filings, indent=2),
             )
 
+            # --- Step 23: fetch a tiny deterministic sample of primary filing texts ---
+            os.makedirs(f"{OUTPUT_DIR}/filings_raw", exist_ok=True)
+
+            allowed_filings_path = f"{OUTPUT_DIR}/allowed_filings.json"
+            allowed_list = read_json_file(allowed_filings_path)
+
+            sample_n = 3  # deterministic small sample for smoke test
+            sample = allowed_list[:sample_n]
+
+            sample_results = []
+            for item in sample:
+                filing = FilingRef(
+                    cik=item["cik"],
+                    company=item["company"],
+                    form_type=item["form_type"],
+                    date_filed=item["date_filed"],
+                    filename=item["filename"],
+                    index_url=item["index_url"],
+                )
+
+                ok, content_bytes, err_str, http_status = fetch_primary_filing_text(
+                    filing=filing,
+                    user_agent=SEC_USER_AGENT,
+                )
+
+                out_name = filing_artifact_basename(filing)
+                out_path = f"{OUTPUT_DIR}/filings_raw/{out_name}"
+                if ok and content_bytes is not None:
+                    write_file_bytes(out_path, content_bytes)
+
+                sample_results.append(
+                    {
+                        "cik": filing.cik,
+                        "company": filing.company,
+                        "form_type": filing.form_type,
+                        "date_filed": filing.date_filed,
+                        "filename": filing.filename,
+                        "index_url": filing.index_url,
+                        "fetch_ok": ok,
+                        "http_status": http_status,
+                        "bytes": (len(content_bytes) if content_bytes is not None else 0),
+                        "error": err_str,
+                        "saved_path": (out_path if ok else None),
+                    }
+                )
+
+            write_file_text(
+                f"{OUTPUT_DIR}/sample_filing_fetch.json",
+                json.dumps(sample_results, indent=2),
+            )
         else:
             error = f"Non-200 or empty body (status={resp.status_code}, bytes={fetched_bytes_len})"
     except Exception as e:
@@ -204,7 +261,7 @@ def main():
             "saved_path": "output/master.idx" if fetch_ok else None,
             "error_body_preview_path": "output/master_idx_error_body.txt" if not fetch_ok else None,
         },
-        "status": "step25_form_allowlist_count",
+        "status": "step23_sample_filing_fetch",
     }
 
     write_file_text(f"{OUTPUT_DIR}/run_metadata.json", json.dumps(run_meta, indent=2))
