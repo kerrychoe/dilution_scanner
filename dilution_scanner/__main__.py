@@ -1,3 +1,4 @@
+```python
 import os
 import json
 import time
@@ -26,7 +27,7 @@ ALLOWED_FORMS = [
 SEC_USER_AGENT = "DilutionTickerScanner/1.0 (contact: kerrychoe@gmail.com)"
 SEC_CONTACT_EMAIL = "kerrychoe@gmail.com"
 
-# Step 31: locked verbose CSV columns (deterministic order)
+# LOCKED verbose CSV columns (deterministic order)
 VERBOSE_COLUMNS = [
     "date",
     "ticker",
@@ -134,7 +135,7 @@ def normalize_cik(cik_str: str) -> str:
 
 def csv_escape(value) -> str:
     """
-    Step 31: stable CSV escaping.
+    Stable CSV escaping.
     - Convert to string
     - Quote if contains comma, quote, CR or LF
     - Escape quotes by doubling
@@ -150,6 +151,29 @@ def csv_escape(value) -> str:
     if needs_quote:
         return f'"{s}"'
     return s
+
+
+# -----------------------------
+# STEP 32: AUDIT LOG HELPERS
+# -----------------------------
+
+def new_audit(run_time_utc: str, scan_date: str) -> dict:
+    return {
+        "run_timestamp_utc": run_time_utc,
+        "scan_date": scan_date,
+        "events": [],
+        "counts": {},
+        "error_samples": [],
+    }
+
+
+def audit_event(audit: dict, event: str, data: dict | None = None):
+    audit["events"].append(
+        {
+            "event": event,
+            "data": (data or {}),
+        }
+    )
 
 
 def _parse_company_tickers_json(raw_bytes: bytes) -> dict:
@@ -262,6 +286,10 @@ def main():
     target_date = start_date
     url = master_idx_url_for_date(target_date)
 
+    # Step 32: initialize audit
+    audit = new_audit(run_time_utc=run_time, scan_date=target_date)
+    audit_event(audit, "run_start", {"date_mode": date_mode, "start_date": start_date, "end_date": end_date})
+
     fetch_status = None
     fetch_ok = False
     fetched_bytes_len = 0
@@ -270,7 +298,7 @@ def main():
     parsed_row_count = 0
     allowed_row_count = 0
 
-    # Step 30: dual-source cik->ticker map
+    # Dual-source cik->ticker map
     cik_to_ticker = {}
     cik_map_ok = False
     cik_map_error = None
@@ -282,10 +310,28 @@ def main():
         cik_map_error = str(e)
         cik_to_ticker = {}
 
-    # Step 31: per-label summary counts (for matched rows only)
+    audit_event(
+        audit,
+        "cik_ticker_map_loaded",
+        {
+            "ok": cik_map_ok,
+            "error": cik_map_error,
+            "meta": cik_map_meta,
+            "count": (len(cik_to_ticker) if cik_map_ok else 0),
+        },
+    )
+
+    # Per-label summary counts (matched rows only)
     label_counts = {}
     matched_rows_count = 0
     blank_ticker_in_matched_rows = 0
+
+    # Step 32 scan counters
+    scan_fetch_fail = 0
+    scan_skipped_due_to_size = 0
+    scan_scanned = 0
+    error_rows = []
+    ERROR_SAMPLE_LIMIT = 25
 
     try:
         resp = sec_get(url)
@@ -305,7 +351,16 @@ def main():
         if resp.status_code == 200 and fetched_bytes_len > 0:
             write_file_bytes(f"{OUTPUT_DIR}/master.idx", content)
             fetch_ok = True
+        else:
+            fetch_ok = False
 
+        audit_event(
+            audit,
+            "master_idx_fetched",
+            {"ok": fetch_ok, "status": fetch_status, "bytes": fetched_bytes_len, "url": url},
+        )
+
+        if fetch_ok:
             text = content.decode("latin-1")
             parsed_rows = parse_master_idx(text)
             parsed_row_count = len(parsed_rows)
@@ -315,6 +370,12 @@ def main():
                 if r.form_type in ("S-1", "S-3", "F-3", "8-K") or r.form_type.startswith("424B"):
                     allowed_rows.append(r)
             allowed_row_count = len(allowed_rows)
+
+            audit_event(
+                audit,
+                "master_idx_parsed",
+                {"parsed_rows": parsed_row_count, "allowed_rows": allowed_row_count},
+            )
 
             allowed_filings = []
             for r in allowed_rows:
@@ -336,7 +397,6 @@ def main():
             verbose_rows = []
             run_tickers = []
 
-            # Step 31: deterministic header from locked columns
             verbose_header = ",".join(VERBOSE_COLUMNS) + "\n"
 
             for item in allowed_filings:
@@ -366,6 +426,24 @@ def main():
                         filing_text = content_bytes.decode("utf-8", errors="replace")
                         labels, matched_terms = scan_filing_text_for_labels(filing_text)
 
+                # Step 32 counters
+                if not ok:
+                    scan_fetch_fail += 1
+                    error_rows.append(
+                        {
+                            "cik": filing.cik,
+                            "form_type": filing.form_type,
+                            "filename": filing.filename,
+                            "http_status": http_status,
+                            "error": err_str,
+                        }
+                    )
+
+                if skipped_due_to_size:
+                    scan_skipped_due_to_size += 1
+                elif ok and content_bytes is not None:
+                    scan_scanned += 1
+
                 cik_key = normalize_cik(filing.cik)
                 ticker_val = cik_to_ticker.get(cik_key, "")
 
@@ -388,7 +466,6 @@ def main():
                     }
                 )
 
-                # Only emit verbose CSV rows when there is at least one label match
                 if labels:
                     matched_rows_count += 1
                     if not ticker_val:
@@ -397,27 +474,19 @@ def main():
                     for lab in labels:
                         label_counts[lab] = label_counts.get(lab, 0) + 1
 
-                    date_val = target_date
-                    accession = accession_from_filename(filing.filename)
-                    filing_url = filing.index_url
-                    free_float_shares = ""
-                    labels_str = "|".join(labels)
-                    terms_str = "|".join(matched_terms)
-
                     row = {
-                        "date": date_val,
+                        "date": target_date,
                         "ticker": ticker_val,
                         "cik": filing.cik,
                         "company": filing.company,
                         "form_type": filing.form_type,
-                        "accession": accession,
-                        "filing_url": filing_url,
-                        "free_float_shares": free_float_shares,
-                        "labels": labels_str,
-                        "matched_terms": terms_str,
+                        "accession": accession_from_filename(filing.filename),
+                        "filing_url": filing.index_url,
+                        "free_float_shares": "",
+                        "labels": "|".join(labels),
+                        "matched_terms": "|".join(matched_terms),
                     }
 
-                    # Step 31: deterministic column order + stable escaping
                     line = ",".join([csv_escape(row.get(col, "")) for col in VERBOSE_COLUMNS]) + "\n"
                     verbose_rows.append(line)
 
@@ -433,7 +502,7 @@ def main():
             prior_all = read_ticker_list(all_path)
             write_ticker_list(all_path, prior_all + run_tickers)
 
-            # Step 31: per-label summary artifacts (optional but deterministic)
+            # Step 31 summary artifacts
             summary = {
                 "date": target_date,
                 "matched_rows": matched_rows_count,
@@ -442,13 +511,40 @@ def main():
             }
             write_file_text(f"{OUTPUT_DIR}/label_summary.json", json.dumps(summary, indent=2))
 
-            # CSV version (deterministic order)
             summary_csv_lines = ["label,count\n"]
             for k in sorted(label_counts.keys()):
                 summary_csv_lines.append(f"{csv_escape(k)},{label_counts[k]}\n")
             write_file_text(f"{OUTPUT_DIR}/label_summary.csv", "".join(summary_csv_lines))
 
-            # Keep sample fetch for debugging (unchanged behavior)
+            # Step 32: write audit_log.json (real)
+            error_rows_sorted = sorted(error_rows, key=lambda x: (x["form_type"], x["cik"], x["filename"]))
+            audit["error_samples"] = error_rows_sorted[:ERROR_SAMPLE_LIMIT]
+
+            audit["counts"] = {
+                "parsed_rows": parsed_row_count,
+                "allowed_rows": allowed_row_count,
+                "matched_rows": matched_rows_count,
+                "blank_ticker_rows": blank_ticker_in_matched_rows,
+                "scan_fetch_fail": scan_fetch_fail,
+                "scan_skipped_due_to_size": scan_skipped_due_to_size,
+                "scan_scanned": scan_scanned,
+            }
+
+            audit_event(
+                audit,
+                "scan_complete",
+                {
+                    "matched_rows": matched_rows_count,
+                    "blank_ticker_rows": blank_ticker_in_matched_rows,
+                    "fetch_fail": scan_fetch_fail,
+                    "skipped_due_to_size": scan_skipped_due_to_size,
+                    "scanned": scan_scanned,
+                },
+            )
+
+            write_file_text(f"{OUTPUT_DIR}/audit_log.json", json.dumps(audit, indent=2))
+
+            # Keep sample fetch for debugging
             os.makedirs(f"{OUTPUT_DIR}/filings_raw", exist_ok=True)
             sample_n = 3
             sample = []
@@ -518,9 +614,24 @@ def main():
             write_file_text(f"{OUTPUT_DIR}/sample_filing_fetch.json", json.dumps(sample_results, indent=2))
 
         else:
-            error = f"Non-200 or empty body (status={resp.status_code}, bytes={fetched_bytes_len})"
+            error = f"Non-200 or empty body (status={fetch_status}, bytes={fetched_bytes_len})"
     except Exception as e:
         error = str(e)
+
+    # Always ensure audit_log.json exists
+    if not os.path.exists(f"{OUTPUT_DIR}/audit_log.json"):
+        # still write something deterministic, even if master fetch failed
+        audit["counts"] = {
+            "parsed_rows": parsed_row_count,
+            "allowed_rows": allowed_row_count,
+            "matched_rows": matched_rows_count,
+            "blank_ticker_rows": blank_ticker_in_matched_rows,
+            "scan_fetch_fail": scan_fetch_fail,
+            "scan_skipped_due_to_size": scan_skipped_due_to_size,
+            "scan_scanned": scan_scanned,
+        }
+        audit_event(audit, "run_end", {"ok": False, "error": error})
+        write_file_text(f"{OUTPUT_DIR}/audit_log.json", json.dumps(audit, indent=2))
 
     # Placeholder outputs if master fetch fails
     if not os.path.exists(f"{OUTPUT_DIR}/dilution_tickers_verbose.csv"):
@@ -529,8 +640,10 @@ def main():
         write_file_text(f"{OUTPUT_DIR}/dilution_tickers.csv", "")
     if not os.path.exists(f"{OUTPUT_DIR}/dilution_tickers_all.csv"):
         write_file_text(f"{OUTPUT_DIR}/dilution_tickers_all.csv", "")
-    if not os.path.exists(f"{OUTPUT_DIR}/audit_log.json"):
-        write_file_text(f"{OUTPUT_DIR}/audit_log.json", json.dumps([], indent=2))
+    if not os.path.exists(f"{OUTPUT_DIR}/label_summary.json"):
+        write_file_text(f"{OUTPUT_DIR}/label_summary.json", json.dumps({}, indent=2))
+    if not os.path.exists(f"{OUTPUT_DIR}/label_summary.csv"):
+        write_file_text(f"{OUTPUT_DIR}/label_summary.csv", "label,count\n")
 
     run_meta = {
         "run_timestamp_utc": run_time,
@@ -563,7 +676,7 @@ def main():
             "label_summary_json": "output/label_summary.json" if fetch_ok else None,
             "label_summary_csv": "output/label_summary.csv" if fetch_ok else None,
         },
-        "status": "step31_deterministic_columns_stable_escaping_label_summary",
+        "status": "step32_audit_log_real",
     }
     write_file_text(f"{OUTPUT_DIR}/run_metadata.json", json.dumps(run_meta, indent=2))
 
@@ -572,6 +685,7 @@ def main():
     print(f"Parsed rows={parsed_row_count}, Allowed rows={allowed_row_count}")
     print(f"CIK->Ticker map ok={cik_map_ok}, combined_count={len(cik_to_ticker) if cik_map_ok else 0}")
     print(f"Matched rows={matched_rows_count}, Blank ticker rows={blank_ticker_in_matched_rows}")
+    print(f"Scan fetch fail={scan_fetch_fail}, skipped_due_to_size={scan_skipped_due_to_size}, scanned={scan_scanned}")
     if cik_map_meta:
         print(f"Filled from exchange: {cik_map_meta.get('filled_from_exchange')}")
     if cik_map_error:
@@ -582,4 +696,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
+```
