@@ -56,9 +56,6 @@ PIPE_TERMS: List[str] = [
     "at-the-market",
     "at the market",
     "atm offering",
-    "equity line of credit",
-    "eLOC",
-    "eliquid",  # leave out if undesired; placeholder example
 ]
 
 CONVERT_TERMS: List[str] = [
