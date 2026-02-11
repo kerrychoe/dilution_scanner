@@ -10,8 +10,8 @@ from dilution_scanner.rules import scan_filing_text_for_labels
 
 OUTPUT_DIR = "output"
 
-# Step 25 requirement (also used for full scan deterministically)
-MAX_SAMPLE_BYTES = 2_000_000  # 2 MB hard cap for filings we fully parse/scan
+# Used as deterministic cap for filings we parse/scan
+MAX_SAMPLE_BYTES = 2_000_000  # 2 MB
 
 # LOCKED form allowlist (deterministic)
 ALLOWED_FORMS = [
@@ -110,7 +110,6 @@ def master_idx_url_for_date(date_iso: str) -> str:
 
 
 def accession_from_filename(filename: str) -> str:
-    # filename example: "edgar/data/1045520/0001104659-26-009236.txt"
     base = os.path.basename(filename)
     if base.lower().endswith(".txt"):
         return base[:-4]
@@ -119,37 +118,21 @@ def accession_from_filename(filename: str) -> str:
 
 def normalize_cik(cik_str: str) -> str:
     """
-    Normalize to the SEC mapping key style:
-      - numeric string without leading zeros
+    Normalize to numeric string without leading zeros (SEC mapping style).
     """
     try:
-        return str(int(cik_str))
+        return str(int(str(cik_str).strip()))
     except Exception:
-        return cik_str.strip()
+        return str(cik_str).strip()
 
 
-def load_cik_to_ticker_map() -> dict:
+def _parse_company_tickers_json(raw_bytes: bytes) -> dict:
     """
-    Deterministically fetch SEC official CIK↔ticker mapping.
-    Source: https://www.sec.gov/files/company_tickers.json
-
-    We also write the raw JSON to output for audit.
+    Parses SEC company_tickers.json:
+    typically dict keyed by "0","1",... values contain cik_str, ticker, title.
+    Returns cik->ticker map.
     """
-    url = "https://www.sec.gov/files/company_tickers.json"
-    resp = sec_get(url)
-
-    if resp.status_code != 200 or not resp.content:
-        raise RuntimeError(f"Failed to fetch company_tickers.json (status={resp.status_code})")
-
-    # Save raw for audit
-    write_file_bytes(f"{OUTPUT_DIR}/sec_company_tickers.json", resp.content)
-
-    # Parse
-    # Format is typically a dict keyed by "0","1",... with values containing cik_str and ticker
-    data = json.loads(resp.content.decode("utf-8", errors="replace"))
-
-    cik_to_ticker = {}
-
+    data = json.loads(raw_bytes.decode("utf-8", errors="replace"))
     if isinstance(data, dict):
         items = data.values()
     elif isinstance(data, list):
@@ -157,6 +140,7 @@ def load_cik_to_ticker_map() -> dict:
     else:
         items = []
 
+    out = {}
     for item in items:
         if not isinstance(item, dict):
             continue
@@ -164,20 +148,91 @@ def load_cik_to_ticker_map() -> dict:
         ticker = item.get("ticker")
         if cik_val is None or ticker is None:
             continue
-
-        cik_key = normalize_cik(str(cik_val))
+        cik_key = normalize_cik(cik_val)
         ticker_val = str(ticker).strip().upper()
         if cik_key and ticker_val:
-            cik_to_ticker[cik_key] = ticker_val
+            out[cik_key] = ticker_val
+    return out
 
-    return cik_to_ticker
+
+def _parse_company_tickers_exchange_json(raw_bytes: bytes) -> dict:
+    """
+    Parses SEC company_tickers_exchange.json:
+    returns cik->ticker map.
+    """
+    data = json.loads(raw_bytes.decode("utf-8", errors="replace"))
+
+    items = []
+    if isinstance(data, dict):
+        # sometimes dict keyed by strings; values are dicts
+        items = list(data.values())
+    elif isinstance(data, list):
+        items = data
+
+    out = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        cik_val = item.get("cik") or item.get("cik_str")
+        ticker = item.get("ticker")
+        if cik_val is None or ticker is None:
+            continue
+        cik_key = normalize_cik(cik_val)
+        ticker_val = str(ticker).strip().upper()
+        if cik_key and ticker_val:
+            out[cik_key] = ticker_val
+    return out
+
+
+def load_cik_to_ticker_map_dual_source() -> tuple:
+    """
+    Step 30:
+    Deterministically fetch two SEC sources and merge:
+      1) company_tickers.json (primary)
+      2) company_tickers_exchange.json (secondary fill-only)
+
+    Returns:
+      (combined_map, meta_dict)
+    """
+    primary_url = "https://www.sec.gov/files/company_tickers.json"
+    exchange_url = "https://www.sec.gov/files/company_tickers_exchange.json"
+
+    # Fetch primary
+    resp1 = sec_get(primary_url)
+    if resp1.status_code != 200 or not resp1.content:
+        raise RuntimeError(f"Failed to fetch company_tickers.json (status={resp1.status_code})")
+    write_file_bytes(f"{OUTPUT_DIR}/sec_company_tickers.json", resp1.content)
+    primary_map = _parse_company_tickers_json(resp1.content)
+
+    # Fetch exchange
+    resp2 = sec_get(exchange_url)
+    if resp2.status_code != 200 or not resp2.content:
+        raise RuntimeError(f"Failed to fetch company_tickers_exchange.json (status={resp2.status_code})")
+    write_file_bytes(f"{OUTPUT_DIR}/sec_company_tickers_exchange.json", resp2.content)
+    exchange_map = _parse_company_tickers_exchange_json(resp2.content)
+
+    # Merge deterministically: primary wins; exchange fills missing only
+    combined = dict(primary_map)
+    filled_from_exchange = 0
+    for cik_key in sorted(exchange_map.keys()):
+        if cik_key not in combined:
+            combined[cik_key] = exchange_map[cik_key]
+            filled_from_exchange += 1
+
+    meta = {
+        "primary_url": primary_url,
+        "exchange_url": exchange_url,
+        "primary_count": len(primary_map),
+        "exchange_count": len(exchange_map),
+        "combined_count": len(combined),
+        "filled_from_exchange": filled_from_exchange,
+        "primary_saved_path": "output/sec_company_tickers.json",
+        "exchange_saved_path": "output/sec_company_tickers_exchange.json",
+    }
+    return combined, meta
 
 
 def read_ticker_list(path: str) -> list:
-    """
-    Reads ticker-only files where each line is a ticker (no header).
-    Deterministic normalization: strip, upper, ignore blanks.
-    """
     if not os.path.exists(path):
         return []
     out = []
@@ -190,10 +245,6 @@ def read_ticker_list(path: str) -> list:
 
 
 def write_ticker_list(path: str, tickers: list):
-    """
-    Writes ticker-only files where each line is a ticker (no header).
-    Deterministic ordering: sorted unique.
-    """
     uniq = sorted(set([t.strip().upper() for t in tickers if t and t.strip()]))
     write_file_text(path, "\n".join(uniq) + ("\n" if uniq else ""))
 
@@ -216,12 +267,13 @@ def main():
     parsed_row_count = 0
     allowed_row_count = 0
 
-    # Step 29: load cik->ticker map once per run (deterministic)
+    # Step 30: dual-source cik->ticker map
     cik_to_ticker = {}
     cik_map_ok = False
     cik_map_error = None
+    cik_map_meta = None
     try:
-        cik_to_ticker = load_cik_to_ticker_map()
+        cik_to_ticker, cik_map_meta = load_cik_to_ticker_map_dual_source()
         cik_map_ok = True
     except Exception as e:
         cik_map_error = str(e)
@@ -234,10 +286,7 @@ def main():
         fetched_bytes_len = len(content)
 
         if resp.status_code != 200:
-            # Save body for debugging (deterministic)
             write_file_bytes(f"{OUTPUT_DIR}/master_idx_error_body.bin", content)
-
-            # Also save a UTF-8 preview (first 2000 chars) for easy inspection
             try:
                 preview = content.decode("utf-8", errors="replace")
             except Exception:
@@ -253,11 +302,9 @@ def main():
             parsed_rows = parse_master_idx(text)
             parsed_row_count = len(parsed_rows)
 
-            # Deterministic allowlist filtering (NO other logic yet)
+            # Deterministic allowlist filtering
             allowed_rows = []
             for r in parsed_rows:
-                # - exact match for S-1, S-3, F-3, 8-K
-                # - prefix match for 424B* via "424B"
                 if r.form_type in ("S-1", "S-3", "F-3", "8-K") or r.form_type.startswith("424B"):
                     allowed_rows.append(r)
 
@@ -276,7 +323,6 @@ def main():
                     }
                 )
 
-            # Deterministic ordering: sort by form_type, then cik, then filename
             allowed_filings.sort(key=lambda x: (x["form_type"], x["cik"], x["filename"]))
 
             write_file_text(
@@ -284,14 +330,13 @@ def main():
                 json.dumps(allowed_filings, indent=2),
             )
 
-            # --- Step 28/29: full deterministic scan of ALL allowed filings + fill ticker ---
-            allowed_list = allowed_filings  # already sorted deterministically
+            # Full deterministic scan of ALL allowed filings + tickers
+            allowed_list = allowed_filings
 
             matched_allowed = []
             verbose_rows = []
             run_tickers = []
 
-            # CSV header (date column first - locked preference)
             verbose_header = (
                 "date,ticker,cik,company,form_type,accession,filing_url,free_float_shares,labels,matched_terms\n"
             )
@@ -323,7 +368,6 @@ def main():
                         filing_text = content_bytes.decode("utf-8", errors="replace")
                         labels, matched_terms = scan_filing_text_for_labels(filing_text)
 
-                # resolve ticker deterministically from cik map (may be empty if map fetch failed)
                 cik_key = normalize_cik(filing.cik)
                 ticker_val = cik_to_ticker.get(cik_key, "")
 
@@ -346,16 +390,14 @@ def main():
                     }
                 )
 
-                # Only emit verbose CSV rows when there is at least one label match
                 if labels:
-                    date_val = target_date  # YYYY-MM-DD
+                    date_val = target_date
                     accession = accession_from_filename(filing.filename)
                     filing_url = filing.index_url
-                    free_float_shares = ""  # future phase
+                    free_float_shares = ""
                     labels_str = "|".join(labels)
                     terms_str = "|".join(matched_terms)
 
-                    # Escape double quotes for CSV safety and wrap company field
                     company_csv = '"' + filing.company.replace('"', '""') + '"'
 
                     verbose_rows.append(
@@ -365,165 +407,27 @@ def main():
                     if ticker_val:
                         run_tickers.append(ticker_val)
 
-            # Write audit JSON of all scans (deterministic order preserved)
             write_file_text(
                 f"{OUTPUT_DIR}/matched_allowed_filings.json",
                 json.dumps(matched_allowed, indent=2),
             )
 
-            # Write verbose CSV (real rows, now with tickers when available)
             write_file_text(
                 f"{OUTPUT_DIR}/dilution_tickers_verbose.csv",
                 verbose_header + "".join(verbose_rows),
             )
 
-            # Step 29: write ticker-only list for THIS run
             write_ticker_list(f"{OUTPUT_DIR}/dilution_tickers.csv", run_tickers)
 
-            # Step 29: update running all-time ticker list (repo-committed)
             all_path = f"{OUTPUT_DIR}/dilution_tickers_all.csv"
             prior_all = read_ticker_list(all_path)
             merged_all = prior_all + run_tickers
             write_ticker_list(all_path, merged_all)
 
-            # --- Keep sample fetch as-is (still useful for debugging) ---
+            # Keep sample fetch for debugging
             os.makedirs(f"{OUTPUT_DIR}/filings_raw", exist_ok=True)
 
-            allowed_filings_path = f"{OUTPUT_DIR}/allowed_filings.json"
-            allowed_list_for_sample = read_json_file(allowed_filings_path)
+            allowed_list_for_sample = allowed_filings
+            sample_n = 3
 
-            sample_n = 3  # deterministic small sample for smoke test
-
-            sample = []
-            seen_ciks = set()
-            for item in allowed_list_for_sample:
-                cik = item["cik"]
-                if cik in seen_ciks:
-                    continue
-                seen_ciks.add(cik)
-                sample.append(item)
-                if len(sample) >= sample_n:
-                    break
-
-            sample_results = []
-            for item in sample:
-                filing = FilingRef(
-                    cik=item["cik"],
-                    company=item["company"],
-                    form_type=item["form_type"],
-                    date_filed=item["date_filed"],
-                    filename=item["filename"],
-                    index_url=item["index_url"],
-                )
-
-                ok, content_bytes, err_str, http_status = fetch_primary_filing_text(
-                    filing=filing,
-                    user_agent=SEC_USER_AGENT,
-                )
-
-                out_name = filing_artifact_basename(filing)
-                out_path = f"{OUTPUT_DIR}/filings_raw/{out_name}"
-
-                bytes_len = (len(content_bytes) if content_bytes is not None else 0)
-                skipped_due_to_size = False
-                saved_path = None
-
-                labels = []
-                matched_terms = []
-
-                if ok and content_bytes is not None:
-                    skipped_due_to_size = bytes_len > MAX_SAMPLE_BYTES
-                    if not skipped_due_to_size:
-                        write_file_bytes(out_path, content_bytes)
-                        saved_path = out_path
-
-                        filing_text = content_bytes.decode("utf-8", errors="replace")
-                        labels, matched_terms = scan_filing_text_for_labels(filing_text)
-                    else:
-                        saved_path = None
-
-                sample_results.append(
-                    {
-                        "cik": filing.cik,
-                        "company": filing.company,
-                        "form_type": filing.form_type,
-                        "date_filed": filing.date_filed,
-                        "filename": filing.filename,
-                        "index_url": filing.index_url,
-                        "fetch_ok": ok,
-                        "http_status": http_status,
-                        "bytes": bytes_len,
-                        "skipped_due_to_size": skipped_due_to_size,
-                        "labels": labels,
-                        "matched_terms": matched_terms,
-                        "error": err_str,
-                        "saved_path": saved_path,
-                    }
-                )
-
-            write_file_text(
-                f"{OUTPUT_DIR}/sample_filing_fetch.json",
-                json.dumps(sample_results, indent=2),
-            )
-
-        else:
-            error = f"Non-200 or empty body (status={resp.status_code}, bytes={fetched_bytes_len})"
-    except Exception as e:
-        error = str(e)
-
-    # Placeholder outputs still created if master fetch fails
-    if not os.path.exists(f"{OUTPUT_DIR}/dilution_tickers_verbose.csv"):
-        write_file_text(
-            f"{OUTPUT_DIR}/dilution_tickers_verbose.csv",
-            "date,ticker,cik,company,form_type,accession,filing_url,free_float_shares,labels,matched_terms\n",
-        )
-    if not os.path.exists(f"{OUTPUT_DIR}/dilution_tickers.csv"):
-        write_file_text(f"{OUTPUT_DIR}/dilution_tickers.csv", "")
-    if not os.path.exists(f"{OUTPUT_DIR}/dilution_tickers_all.csv"):
-        write_file_text(f"{OUTPUT_DIR}/dilution_tickers_all.csv", "")
-    if not os.path.exists(f"{OUTPUT_DIR}/audit_log.json"):
-        write_file_text(f"{OUTPUT_DIR}/audit_log.json", json.dumps([], indent=2))
-
-    run_meta = {
-        "run_timestamp_utc": run_time,
-        "scan_start_date": start_date,
-        "scan_end_date": end_date,
-        "date_mode": date_mode,
-        "allowed_forms": ALLOWED_FORMS,
-        "sec_user_agent": SEC_USER_AGENT,
-        "master_idx_parsed_rows": parsed_row_count,
-        "master_idx_allowed_rows": allowed_row_count,
-        "cik_ticker_map": {
-            "ok": cik_map_ok,
-            "error": cik_map_error,
-            "saved_path": "output/sec_company_tickers.json" if cik_map_ok else None,
-            "count": len(cik_to_ticker) if cik_map_ok else 0,
-        },
-        "master_idx_fetch": {
-            "date": target_date,
-            "url": url,
-            "ok": fetch_ok,
-            "status": fetch_status,
-            "bytes": fetched_bytes_len,
-            "error": error,
-            "saved_path": "output/master.idx" if fetch_ok else None,
-            "error_body_preview_path": "output/master_idx_error_body.txt" if not fetch_ok else None,
-        },
-        "status": "step29_cik_to_ticker_and_ticker_csvs",
-    }
-
-    write_file_text(f"{OUTPUT_DIR}/run_metadata.json", json.dumps(run_meta, indent=2))
-
-    print(f"Master idx URL: {url}")
-    print(f"Fetch ok={fetch_ok}, status={fetch_status}, bytes={fetched_bytes_len}")
-    print(f"Parsed rows={parsed_row_count}, Allowed rows={allowed_row_count}")
-    print(f"CIK->Ticker map ok={cik_map_ok}, count={len(cik_to_ticker) if cik_map_ok else 0}")
-    if cik_map_error:
-        print(f"CIK map error: {cik_map_error}")
-    if error:
-        print(f"Error: {error}")
-
-
-if __name__ == "__main__":
-    main()
-
+            samp
