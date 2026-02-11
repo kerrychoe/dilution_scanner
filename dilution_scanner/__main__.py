@@ -3,6 +3,7 @@ import json
 import time
 import requests
 from datetime import datetime, timedelta, timezone
+
 from dilution_scanner.master_idx_parser import parse_master_idx
 
 OUTPUT_DIR = "output"
@@ -24,13 +25,16 @@ SEC_CONTACT_EMAIL = "kerrychoe@gmail.com"
 def ensure_output_dir():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+
 def write_file_bytes(path, content_bytes: bytes):
     with open(path, "wb") as f:
         f.write(content_bytes)
 
+
 def write_file_text(path, content_text: str):
     with open(path, "w", encoding="utf-8") as f:
         f.write(content_text)
+
 
 def parse_dates():
     start_env = os.getenv("START_DATE", "").strip()
@@ -47,6 +51,7 @@ def parse_dates():
         mode = "default_yesterday"
 
     return start_date, end_date, mode
+
 
 def sec_get(url: str, timeout_sec: int = 30) -> requests.Response:
     """
@@ -91,13 +96,14 @@ def master_idx_url_for_date(date_iso: str) -> str:
     yyyymmdd = f"{year}{month}{day}"
     return f"https://www.sec.gov/Archives/edgar/daily-index/{y}/QTR{qtr}/master.{yyyymmdd}.idx"
 
+
 def main():
     ensure_output_dir()
 
     run_time = datetime.now(timezone.utc).isoformat()
     start_date, end_date, date_mode = parse_dates()
 
-    # For this step: fetch ONLY the start_date master.idx
+    # For now: fetch ONLY the start_date master.idx
     target_date = start_date
     url = master_idx_url_for_date(target_date)
 
@@ -105,35 +111,47 @@ def main():
     fetch_ok = False
     fetched_bytes_len = 0
     error = None
+
     parsed_row_count = 0
+    allowed_row_count = 0
 
     try:
         resp = sec_get(url)
         fetch_status = resp.status_code
         content = resp.content
+        fetched_bytes_len = len(content)
+
         if resp.status_code != 200:
             # Save body for debugging (deterministic)
             write_file_bytes(f"{OUTPUT_DIR}/master_idx_error_body.bin", content)
+
             # Also save a UTF-8 preview (first 2000 chars) for easy inspection
             try:
                 preview = content.decode("utf-8", errors="replace")
             except Exception:
                 preview = "<decode_failed>"
-
             preview = preview[:2000]
             write_file_text(f"{OUTPUT_DIR}/master_idx_error_body.txt", preview)
-        fetched_bytes_len = len(content)
+
         if resp.status_code == 200 and fetched_bytes_len > 0:
             write_file_bytes(f"{OUTPUT_DIR}/master.idx", content)
             fetch_ok = True
-        
+
             text = content.decode("latin-1")
             parsed_rows = parse_master_idx(text)
             parsed_row_count = len(parsed_rows)
+
+            # Deterministic allowlist filtering (NO other logic yet)
+            allowed_rows = []
+            for r in parsed_rows:
+                # - exact match for S-1, S-3, F-3, 8-K
+                # - prefix match for 424B* via "424B"
+                if r.form_type in ("S-1", "S-3", "F-3", "8-K") or r.form_type.startswith("424B"):
+                    allowed_rows.append(r)
+
+            allowed_row_count = len(allowed_rows)
         else:
             error = f"Non-200 or empty body (status={resp.status_code}, bytes={fetched_bytes_len})"
-            parsed_row_count = 0
-
     except Exception as e:
         error = str(e)
 
@@ -153,7 +171,8 @@ def main():
         "date_mode": date_mode,
         "allowed_forms": ALLOWED_FORMS,
         "sec_user_agent": SEC_USER_AGENT,
-        "master_idx_parsed_rows": parsed_row_count,        
+        "master_idx_parsed_rows": parsed_row_count,
+        "master_idx_allowed_rows": allowed_row_count,
         "master_idx_fetch": {
             "date": target_date,
             "url": url,
@@ -162,17 +181,19 @@ def main():
             "bytes": fetched_bytes_len,
             "error": error,
             "saved_path": "output/master.idx" if fetch_ok else None,
-            "error_body_preview_path": "output/master_idx_error_body.txt" if not fetch_ok else None,            
+            "error_body_preview_path": "output/master_idx_error_body.txt" if not fetch_ok else None,
         },
-        "status": "step13_master_idx_fetch",
+        "status": "step25_form_allowlist_count",
     }
 
     write_file_text(f"{OUTPUT_DIR}/run_metadata.json", json.dumps(run_meta, indent=2))
 
     print(f"Master idx URL: {url}")
     print(f"Fetch ok={fetch_ok}, status={fetch_status}, bytes={fetched_bytes_len}")
+    print(f"Parsed rows={parsed_row_count}, Allowed rows={allowed_row_count}")
     if error:
         print(f"Error: {error}")
+
 
 if __name__ == "__main__":
     main()
