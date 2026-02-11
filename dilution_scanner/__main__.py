@@ -185,7 +185,18 @@ def main():
             allowed_list = read_json_file(allowed_filings_path)
 
             sample_n = 3  # deterministic small sample for smoke test
-            sample = allowed_list[:sample_n]
+            
+            sample = []
+            seen_ciks = set()
+            for item in allowed_list:
+                cik = item["cik"]
+                if cik in seen_ciks:
+                    continue
+                seen_ciks.add(cik)
+                sample.append(item)
+                if len(sample) >= sample_n:
+                    break
+
 
             sample_results = []
             for item in sample:
