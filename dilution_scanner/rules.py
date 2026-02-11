@@ -35,7 +35,6 @@ DILUTION_BANK_NAMES: List[str] = [
     "hc wainwright",
     "roth capital",
     "roth mkms",
-    "ladder capital",  # (if you don't want this here later, remove explicitly)
     "thinkequity",
     "boustead securities",
     "westpark capital",
@@ -44,9 +43,9 @@ DILUTION_BANK_NAMES: List[str] = [
     "a.g.p.",
     "agp",
     "alliance global partners",
-    "warrants",
     # Note: Keep bank list conservative; expand later with explicit additions.
 ]
+
 
 PIPE_TERMS: List[str] = [
     "pipe financing",
