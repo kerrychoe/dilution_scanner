@@ -364,4 +364,222 @@ def main():
                     skipped_due_to_size = bytes_len > MAX_SAMPLE_BYTES
                     if not skipped_due_to_size:
                         filing_text = content_bytes.decode("utf-8", errors="replace")
-                        labels, matched_terms = scan_
+                        labels, matched_terms = scan_filing_text_for_labels(filing_text)
+
+                cik_key = normalize_cik(filing.cik)
+                ticker_val = cik_to_ticker.get(cik_key, "")
+
+                matched_allowed.append(
+                    {
+                        "cik": filing.cik,
+                        "ticker": ticker_val,
+                        "company": filing.company,
+                        "form_type": filing.form_type,
+                        "date_filed": filing.date_filed,
+                        "filename": filing.filename,
+                        "index_url": filing.index_url,
+                        "fetch_ok": ok,
+                        "http_status": http_status,
+                        "bytes": bytes_len,
+                        "skipped_due_to_size": skipped_due_to_size,
+                        "labels": labels,
+                        "matched_terms": matched_terms,
+                        "error": err_str,
+                    }
+                )
+
+                # Only emit verbose CSV rows when there is at least one label match
+                if labels:
+                    matched_rows_count += 1
+                    if not ticker_val:
+                        blank_ticker_in_matched_rows += 1
+
+                    for lab in labels:
+                        label_counts[lab] = label_counts.get(lab, 0) + 1
+
+                    date_val = target_date
+                    accession = accession_from_filename(filing.filename)
+                    filing_url = filing.index_url
+                    free_float_shares = ""
+                    labels_str = "|".join(labels)
+                    terms_str = "|".join(matched_terms)
+
+                    row = {
+                        "date": date_val,
+                        "ticker": ticker_val,
+                        "cik": filing.cik,
+                        "company": filing.company,
+                        "form_type": filing.form_type,
+                        "accession": accession,
+                        "filing_url": filing_url,
+                        "free_float_shares": free_float_shares,
+                        "labels": labels_str,
+                        "matched_terms": terms_str,
+                    }
+
+                    # Step 31: deterministic column order + stable escaping
+                    line = ",".join([csv_escape(row.get(col, "")) for col in VERBOSE_COLUMNS]) + "\n"
+                    verbose_rows.append(line)
+
+                    if ticker_val:
+                        run_tickers.append(ticker_val)
+
+            write_file_text(f"{OUTPUT_DIR}/matched_allowed_filings.json", json.dumps(matched_allowed, indent=2))
+            write_file_text(f"{OUTPUT_DIR}/dilution_tickers_verbose.csv", verbose_header + "".join(verbose_rows))
+
+            write_ticker_list(f"{OUTPUT_DIR}/dilution_tickers.csv", run_tickers)
+
+            all_path = f"{OUTPUT_DIR}/dilution_tickers_all.csv"
+            prior_all = read_ticker_list(all_path)
+            write_ticker_list(all_path, prior_all + run_tickers)
+
+            # Step 31: per-label summary artifacts (optional but deterministic)
+            summary = {
+                "date": target_date,
+                "matched_rows": matched_rows_count,
+                "blank_ticker_rows": blank_ticker_in_matched_rows,
+                "label_counts": {k: label_counts[k] for k in sorted(label_counts.keys())},
+            }
+            write_file_text(f"{OUTPUT_DIR}/label_summary.json", json.dumps(summary, indent=2))
+
+            # CSV version (deterministic order)
+            summary_csv_lines = ["label,count\n"]
+            for k in sorted(label_counts.keys()):
+                summary_csv_lines.append(f"{csv_escape(k)},{label_counts[k]}\n")
+            write_file_text(f"{OUTPUT_DIR}/label_summary.csv", "".join(summary_csv_lines))
+
+            # Keep sample fetch for debugging (unchanged behavior)
+            os.makedirs(f"{OUTPUT_DIR}/filings_raw", exist_ok=True)
+            sample_n = 3
+            sample = []
+            seen_ciks = set()
+            for item in allowed_filings:
+                cik = item["cik"]
+                if cik in seen_ciks:
+                    continue
+                seen_ciks.add(cik)
+                sample.append(item)
+                if len(sample) >= sample_n:
+                    break
+
+            sample_results = []
+            for item in sample:
+                filing = FilingRef(
+                    cik=item["cik"],
+                    company=item["company"],
+                    form_type=item["form_type"],
+                    date_filed=item["date_filed"],
+                    filename=item["filename"],
+                    index_url=item["index_url"],
+                )
+
+                ok, content_bytes, err_str, http_status = fetch_primary_filing_text(
+                    filing=filing,
+                    user_agent=SEC_USER_AGENT,
+                )
+
+                out_name = filing_artifact_basename(filing)
+                out_path = f"{OUTPUT_DIR}/filings_raw/{out_name}"
+
+                bytes_len = (len(content_bytes) if content_bytes is not None else 0)
+                skipped_due_to_size = False
+                saved_path = None
+
+                labels = []
+                matched_terms = []
+
+                if ok and content_bytes is not None:
+                    skipped_due_to_size = bytes_len > MAX_SAMPLE_BYTES
+                    if not skipped_due_to_size:
+                        write_file_bytes(out_path, content_bytes)
+                        saved_path = out_path
+                        filing_text = content_bytes.decode("utf-8", errors="replace")
+                        labels, matched_terms = scan_filing_text_for_labels(filing_text)
+
+                sample_results.append(
+                    {
+                        "cik": filing.cik,
+                        "company": filing.company,
+                        "form_type": filing.form_type,
+                        "date_filed": filing.date_filed,
+                        "filename": filing.filename,
+                        "index_url": filing.index_url,
+                        "fetch_ok": ok,
+                        "http_status": http_status,
+                        "bytes": bytes_len,
+                        "skipped_due_to_size": skipped_due_to_size,
+                        "labels": labels,
+                        "matched_terms": matched_terms,
+                        "error": err_str,
+                        "saved_path": (saved_path if saved_path else None),
+                    }
+                )
+
+            write_file_text(f"{OUTPUT_DIR}/sample_filing_fetch.json", json.dumps(sample_results, indent=2))
+
+        else:
+            error = f"Non-200 or empty body (status={resp.status_code}, bytes={fetched_bytes_len})"
+    except Exception as e:
+        error = str(e)
+
+    # Placeholder outputs if master fetch fails
+    if not os.path.exists(f"{OUTPUT_DIR}/dilution_tickers_verbose.csv"):
+        write_file_text(f"{OUTPUT_DIR}/dilution_tickers_verbose.csv", ",".join(VERBOSE_COLUMNS) + "\n")
+    if not os.path.exists(f"{OUTPUT_DIR}/dilution_tickers.csv"):
+        write_file_text(f"{OUTPUT_DIR}/dilution_tickers.csv", "")
+    if not os.path.exists(f"{OUTPUT_DIR}/dilution_tickers_all.csv"):
+        write_file_text(f"{OUTPUT_DIR}/dilution_tickers_all.csv", "")
+    if not os.path.exists(f"{OUTPUT_DIR}/audit_log.json"):
+        write_file_text(f"{OUTPUT_DIR}/audit_log.json", json.dumps([], indent=2))
+
+    run_meta = {
+        "run_timestamp_utc": run_time,
+        "scan_start_date": start_date,
+        "scan_end_date": end_date,
+        "date_mode": date_mode,
+        "allowed_forms": ALLOWED_FORMS,
+        "sec_user_agent": SEC_USER_AGENT,
+        "cik_ticker_map": {
+            "ok": cik_map_ok,
+            "error": cik_map_error,
+            "meta": cik_map_meta,
+        },
+        "master_idx_parsed_rows": parsed_row_count,
+        "master_idx_allowed_rows": allowed_row_count,
+        "master_idx_fetch": {
+            "date": target_date,
+            "url": url,
+            "ok": fetch_ok,
+            "status": fetch_status,
+            "bytes": fetched_bytes_len,
+            "error": error,
+            "saved_path": "output/master.idx" if fetch_ok else None,
+            "error_body_preview_path": "output/master_idx_error_body.txt" if not fetch_ok else None,
+        },
+        "step31_summary": {
+            "matched_rows": matched_rows_count,
+            "blank_ticker_rows": blank_ticker_in_matched_rows,
+            "label_counts": {k: label_counts[k] for k in sorted(label_counts.keys())},
+            "label_summary_json": "output/label_summary.json" if fetch_ok else None,
+            "label_summary_csv": "output/label_summary.csv" if fetch_ok else None,
+        },
+        "status": "step31_deterministic_columns_stable_escaping_label_summary",
+    }
+    write_file_text(f"{OUTPUT_DIR}/run_metadata.json", json.dumps(run_meta, indent=2))
+
+    print(f"Master idx URL: {url}")
+    print(f"Fetch ok={fetch_ok}, status={fetch_status}, bytes={fetched_bytes_len}")
+    print(f"Parsed rows={parsed_row_count}, Allowed rows={allowed_row_count}")
+    print(f"CIK->Ticker map ok={cik_map_ok}, combined_count={len(cik_to_ticker) if cik_map_ok else 0}")
+    print(f"Matched rows={matched_rows_count}, Blank ticker rows={blank_ticker_in_matched_rows}")
+    if cik_map_meta:
+        print(f"Filled from exchange: {cik_map_meta.get('filled_from_exchange')}")
+    if cik_map_error:
+        print(f"CIK map error: {cik_map_error}")
+    if error:
+        print(f"Error: {error}")
+
+
+if __name__ == "__main__":
+    main()
+
