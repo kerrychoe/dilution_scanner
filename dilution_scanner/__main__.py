@@ -1,288 +1,290 @@
-import os
-import json
-import time
-import requests
-from datetime import datetime, timedelta, timezone
+# dilution_scanner/__main__.py
 
-from dilution_scanner.master_idx_parser import parse_master_idx
-from dilution_scanner.filings import FilingRef, fetch_primary_filing_text, filing_artifact_basename
+from __future__ import annotations
+
+import datetime as dt
+import json
+import os
+import time
+from dataclasses import asdict
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+from .filings import (
+    FilingRef,
+    fetch_primary_filing_text,
+    filing_artifact_basename,
+)
+from .master_idx_parser import (
+    fetch_master_idx_text,
+    parse_master_idx_rows,
+)
+
+# -----------------------------
+# LOCKED / DETERMINISTIC CONSTANTS
+# -----------------------------
 
 OUTPUT_DIR = "output"
 
-# LOCKED form allowlist (deterministic)
-ALLOWED_FORMS = [
-    "424B",
-    "S-3",
-    "S-1",
-    "F-3",
-    "8-K",
-]
+# SEC-compliant identity encoding is handled in filings.py and master_idx_parser.py.
+# Deterministic retry/backoff also handled there.
 
-# SEC requires a descriptive User-Agent with real contact email
-SEC_USER_AGENT = "DilutionTickerScanner/1.0 (contact: kerrychoe@gmail.com)"
-SEC_CONTACT_EMAIL = "kerrychoe@gmail.com"
+# Step 25 requirement:
+MAX_SAMPLE_BYTES = 2_000_000  # 2 MB hard cap for sample filings
 
 
-def ensure_output_dir():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+# -----------------------------
+# SMALL UTILITIES
+# -----------------------------
+
+def ensure_dir(path: str) -> None:
+    Path(path).mkdir(parents=True, exist_ok=True)
 
 
-def write_file_bytes(path, content_bytes: bytes):
-    with open(path, "wb") as f:
-        f.write(content_bytes)
+def write_file_text(path: str, content: str) -> None:
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "w", encoding="utf-8") as f:
+        f.write(content)
 
 
-def write_file_text(path, content_text: str):
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(content_text)
+def utc_today() -> dt.date:
+    return dt.datetime.utcnow().date()
 
 
-def read_json_file(path: str):
+def parse_date_env(name: str) -> Optional[dt.date]:
+    v = os.getenv(name)
+    if not v:
+        return None
+    # Expected: YYYY-MM-DD
+    return dt.date.fromisoformat(v.strip())
+
+
+def resolve_date_range() -> Tuple[dt.date, dt.date]:
+    """
+    Deterministic date handling (LOCKED):
+    - If START_DATE / END_DATE provided => use inclusive range
+    - Else default to yesterday UTC (single day)
+    """
+    start = parse_date_env("START_DATE")
+    end = parse_date_env("END_DATE")
+
+    if start and end:
+        if end < start:
+            raise ValueError("END_DATE must be >= START_DATE")
+        return start, end
+
+    if start and not end:
+        return start, start
+
+    if end and not start:
+        return end, end
+
+    yday = utc_today() - dt.timedelta(days=1)
+    return yday, yday
+
+
+def daterange_inclusive(start: dt.date, end: dt.date):
+    cur = start
+    while cur <= end:
+        yield cur
+        cur += dt.timedelta(days=1)
+
+
+def load_json(path: str) -> object:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
-def parse_dates():
-    start_env = os.getenv("START_DATE", "").strip()
-    end_env = os.getenv("END_DATE", "").strip()
+# -----------------------------
+# MAIN
+# -----------------------------
 
-    if start_env and end_env:
-        start_date = start_env
-        end_date = end_env
-        mode = "explicit"
-    else:
-        yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).date().isoformat()
-        start_date = yesterday
-        end_date = yesterday
-        mode = "default_yesterday"
+def main() -> int:
+    started_utc = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    run_id = started_utc.replace(":", "").replace("-", "")
 
-    return start_date, end_date, mode
+    ensure_dir(OUTPUT_DIR)
 
+    start_date, end_date = resolve_date_range()
 
-def sec_get(url: str, timeout_sec: int = 30) -> requests.Response:
-    """
-    Deterministic SEC GET:
-    - Fixed identifying headers (User-Agent + From)
-    - Identity encoding (no compression)
-    - Basic retry with fixed backoff
-    """
-    headers = {
-        "User-Agent": SEC_USER_AGENT,
-        "From": SEC_CONTACT_EMAIL,
-        "Accept": "text/plain,application/octet-stream,*/*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "identity",
-        "Connection": "close",
-        "Referer": "https://www.sec.gov/",
+    # Phase: Fetch + parse master.idx (LOCKED behavior)
+    # NOTE: Current verified behavior fetches one master.idx per run (start_date).
+    # We keep that behavior as stated in your repo state.
+    scan_date = start_date
+
+    master_idx_text = fetch_master_idx_text(scan_date)
+
+    rows = parse_master_idx_rows(master_idx_text)
+
+    # Persist full parsed count for audits
+    run_metadata = {
+        "run_id": run_id,
+        "started_utc": started_utc,
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "scan_date": scan_date.isoformat(),
+        "rows_parsed_total": len(rows),
     }
 
-    last_exc = None
-    for attempt in range(1, 4):  # 3 attempts max
-        try:
-            resp = requests.get(url, headers=headers, timeout=timeout_sec)
-            return resp
-        except Exception as e:
-            last_exc = e
-            # fixed backoff: 1s, 2s, 3s
-            time.sleep(attempt)
+    # Apply allowlist filter (LOCKED)
+    allowed_prefixes = ("424B",)
+    allowed_exact = {"S-1", "S-3", "F-3", "8-K"}
 
-    raise RuntimeError(f"SEC GET failed after 3 attempts: {url}") from last_exc
+    allowed_rows = []
+    for r in rows:
+        ft = r["form_type"]
+        if ft in allowed_exact or any(ft.startswith(p) for p in allowed_prefixes):
+            allowed_rows.append(r)
 
+    run_metadata["rows_allowed_total"] = len(allowed_rows)
 
-def master_idx_url_for_date(date_iso: str) -> str:
-    """
-    date_iso: YYYY-MM-DD
-    SEC daily index path format:
-      https://www.sec.gov/Archives/edgar/daily-index/YYYY/QTR{1-4}/master.YYYYMMDD.idx
-    """
-    year, month, day = date_iso.split("-")
-    y = int(year)
-    m = int(month)
-    qtr = (m - 1) // 3 + 1
-    yyyymmdd = f"{year}{month}{day}"
-    return f"https://www.sec.gov/Archives/edgar/daily-index/{y}/QTR{qtr}/master.{yyyymmdd}.idx"
-
-
-def main():
-    ensure_output_dir()
-
-    run_time = datetime.now(timezone.utc).isoformat()
-    start_date, end_date, date_mode = parse_dates()
-
-    # For now: fetch ONLY the start_date master.idx
-    target_date = start_date
-    url = master_idx_url_for_date(target_date)
-
-    fetch_status = None
-    fetch_ok = False
-    fetched_bytes_len = 0
-    error = None
-
-    parsed_row_count = 0
-    allowed_row_count = 0
-
-    try:
-        resp = sec_get(url)
-        fetch_status = resp.status_code
-        content = resp.content
-        fetched_bytes_len = len(content)
-
-        if resp.status_code != 200:
-            # Save body for debugging (deterministic)
-            write_file_bytes(f"{OUTPUT_DIR}/master_idx_error_body.bin", content)
-
-            # Also save a UTF-8 preview (first 2000 chars) for easy inspection
-            try:
-                preview = content.decode("utf-8", errors="replace")
-            except Exception:
-                preview = "<decode_failed>"
-            preview = preview[:2000]
-            write_file_text(f"{OUTPUT_DIR}/master_idx_error_body.txt", preview)
-
-        if resp.status_code == 200 and fetched_bytes_len > 0:
-            write_file_bytes(f"{OUTPUT_DIR}/master.idx", content)
-            fetch_ok = True
-
-            text = content.decode("latin-1")
-            parsed_rows = parse_master_idx(text)
-            parsed_row_count = len(parsed_rows)
-
-            # Deterministic allowlist filtering (NO other logic yet)
-            allowed_rows = []
-            for r in parsed_rows:
-                # - exact match for S-1, S-3, F-3, 8-K
-                # - prefix match for 424B* via "424B"
-                if r.form_type in ("S-1", "S-3", "F-3", "8-K") or r.form_type.startswith("424B"):
-                    allowed_rows.append(r)
-
-            allowed_row_count = len(allowed_rows)
-
-            allowed_filings = []
-            for r in allowed_rows:
-                allowed_filings.append(
-                    {
-                        "cik": r.cik,
-                        "company": r.company,
-                        "form_type": r.form_type,
-                        "date_filed": r.date_filed,
-                        "filename": r.filename,
-                        "index_url": f"https://www.sec.gov/Archives/{r.filename}",
-                    }
-                )
-
-            # Deterministic ordering: sort by form_type, then cik, then filename
-            allowed_filings.sort(key=lambda x: (x["form_type"], x["cik"], x["filename"]))
-
-            write_file_text(
-                f"{OUTPUT_DIR}/allowed_filings.json",
-                json.dumps(allowed_filings, indent=2),
-            )
-
-            # --- Step 23: fetch a tiny deterministic sample of primary filing texts ---
-            os.makedirs(f"{OUTPUT_DIR}/filings_raw", exist_ok=True)
-
-            allowed_filings_path = f"{OUTPUT_DIR}/allowed_filings.json"
-            allowed_list = read_json_file(allowed_filings_path)
-
-            sample_n = 3  # deterministic small sample for smoke test
-            
-            sample = []
-            seen_ciks = set()
-            for item in allowed_list:
-                cik = item["cik"]
-                if cik in seen_ciks:
-                    continue
-                seen_ciks.add(cik)
-                sample.append(item)
-                if len(sample) >= sample_n:
-                    break
-
-
-            sample_results = []
-            for item in sample:
-                filing = FilingRef(
-                    cik=item["cik"],
-                    company=item["company"],
-                    form_type=item["form_type"],
-                    date_filed=item["date_filed"],
-                    filename=item["filename"],
-                    index_url=item["index_url"],
-                )
-
-                ok, content_bytes, err_str, http_status = fetch_primary_filing_text(
-                    filing=filing,
-                    user_agent=SEC_USER_AGENT,
-                )
-
-                out_name = filing_artifact_basename(filing)
-                out_path = f"{OUTPUT_DIR}/filings_raw/{out_name}"
-                if ok and content_bytes is not None:
-                    write_file_bytes(out_path, content_bytes)
-
-                sample_results.append(
-                    {
-                        "cik": filing.cik,
-                        "company": filing.company,
-                        "form_type": filing.form_type,
-                        "date_filed": filing.date_filed,
-                        "filename": filing.filename,
-                        "index_url": filing.index_url,
-                        "fetch_ok": ok,
-                        "http_status": http_status,
-                        "bytes": (len(content_bytes) if content_bytes is not None else 0),
-                        "error": err_str,
-                        "saved_path": (out_path if ok else None),
-                    }
-                )
-
-            write_file_text(
-                f"{OUTPUT_DIR}/sample_filing_fetch.json",
-                json.dumps(sample_results, indent=2),
-            )
-        else:
-            error = f"Non-200 or empty body (status={resp.status_code}, bytes={fetched_bytes_len})"
-    except Exception as e:
-        error = str(e)
-
-    # Placeholder outputs still created
-    write_file_text(
-        f"{OUTPUT_DIR}/dilution_tickers_verbose.csv",
-        "date,ticker,cik,company,form_type,accession,filing_url,free_float_shares,labels,matched_terms\n",
+    # Build allowed_filings.json in deterministic order
+    # Sort deterministically by (form_type, cik, filename)
+    allowed_rows_sorted = sorted(
+        allowed_rows,
+        key=lambda x: (x["form_type"], x["cik"], x["filename"]),
     )
-    write_file_text(f"{OUTPUT_DIR}/dilution_tickers.csv", "")
-    write_file_text(f"{OUTPUT_DIR}/dilution_tickers_all.csv", "")
-    write_file_text(f"{OUTPUT_DIR}/audit_log.json", json.dumps([], indent=2))
 
-    run_meta = {
-        "run_timestamp_utc": run_time,
-        "scan_start_date": start_date,
-        "scan_end_date": end_date,
-        "date_mode": date_mode,
-        "allowed_forms": ALLOWED_FORMS,
-        "sec_user_agent": SEC_USER_AGENT,
-        "master_idx_parsed_rows": parsed_row_count,
-        "master_idx_allowed_rows": allowed_row_count,
-        "master_idx_fetch": {
-            "date": target_date,
-            "url": url,
-            "ok": fetch_ok,
-            "status": fetch_status,
-            "bytes": fetched_bytes_len,
-            "error": error,
-            "saved_path": "output/master.idx" if fetch_ok else None,
-            "error_body_preview_path": "output/master_idx_error_body.txt" if not fetch_ok else None,
-        },
-        "status": "step23_sample_filing_fetch",
-    }
+    allowed_filings = []
+    for r in allowed_rows_sorted:
+        allowed_filings.append(
+            {
+                "cik": r["cik"],
+                "company": r["company"],
+                "form_type": r["form_type"],
+                "date_filed": r["date_filed"],
+                "filename": r["filename"],
+                "index_url": r["index_url"],
+            }
+        )
 
-    write_file_text(f"{OUTPUT_DIR}/run_metadata.json", json.dumps(run_meta, indent=2))
+    write_file_text(
+        f"{OUTPUT_DIR}/allowed_filings.json",
+        json.dumps(allowed_filings, indent=2),
+    )
 
-    print(f"Master idx URL: {url}")
-    print(f"Fetch ok={fetch_ok}, status={fetch_status}, bytes={fetched_bytes_len}")
-    print(f"Parsed rows={parsed_row_count}, Allowed rows={allowed_row_count}")
-    if error:
-        print(f"Error: {error}")
+    # -----------------------------
+    # Step 23 (existing): Sample filing fetch (first 3 unique CIKs)
+    # Step 25 (new): Size cap + skip large files but record them
+    # -----------------------------
+    sample_results: List[Dict] = []
+
+    # Determine first 3 unique CIKs in deterministic order from allowed_filings
+    unique_ciks = []
+    seen = set()
+    for r in allowed_filings:
+        cik = r["cik"]
+        if cik not in seen:
+            seen.add(cik)
+            unique_ciks.append(cik)
+        if len(unique_ciks) >= 3:
+            break
+
+    # Fetch sample filings for those CIKs (deterministic: first occurrence per CIK)
+    for cik in unique_ciks:
+        # pick the first allowed filing for that cik in allowed_filings list
+        filing_row = None
+        for r in allowed_filings:
+            if r["cik"] == cik:
+                filing_row = r
+                break
+
+        if not filing_row:
+            continue
+
+        filing_ref = FilingRef(
+            cik=filing_row["cik"],
+            company=filing_row["company"],
+            form_type=filing_row["form_type"],
+            date_filed=filing_row["date_filed"],
+            filename=filing_row["filename"],
+            index_url=filing_row["index_url"],
+        )
+
+        output_path = Path(
+            OUTPUT_DIR,
+            "filings_raw",
+            filing_artifact_basename(filing_ref),
+        )
+
+        # Fetch the filing text
+        fetch_ok = False
+        http_status = None
+        error = None
+        content_text = ""
+
+        try:
+            content_text = fetch_primary_filing_text(filing_ref)
+            fetch_ok = True
+        except Exception as e:
+            error = str(e)
+
+        # Deterministic bytes accounting (Step 25)
+        # If fetch failed, bytes=0 and we won't write any file.
+        content_bytes = 0
+        skipped_due_to_size = False
+        saved_path: Optional[str] = None
+
+        if fetch_ok:
+            content_bytes = len(content_text.encode("utf-8"))
+            skipped_due_to_size = content_bytes > MAX_SAMPLE_BYTES
+
+            if not skipped_due_to_size:
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(output_path, "w", encoding="utf-8") as f:
+                    f.write(content_text)
+                saved_path = str(output_path)
+
+        sample_results.append(
+            {
+                "cik": filing_ref.cik,
+                "company": filing_ref.company,
+                "form_type": filing_ref.form_type,
+                "date_filed": filing_ref.date_filed,
+                "filename": filing_ref.filename,
+                "index_url": filing_ref.index_url,
+                "fetch_ok": fetch_ok,
+                "http_status": http_status,
+                "bytes": content_bytes,
+                "skipped_due_to_size": skipped_due_to_size,
+                "error": error,
+                "saved_path": saved_path,
+            }
+        )
+
+        # Fixed deterministic delay between fetches (Step 23 behavior)
+        time.sleep(0.25)
+
+    write_file_text(
+        f"{OUTPUT_DIR}/sample_filing_fetch.json",
+        json.dumps(sample_results, indent=2),
+    )
+
+    # Audit artifacts
+    write_file_text(
+        f"{OUTPUT_DIR}/run_metadata.json",
+        json.dumps(run_metadata, indent=2),
+    )
+    write_file_text(
+        f"{OUTPUT_DIR}/audit_log.json",
+        json.dumps(
+            {
+                "run_id": run_id,
+                "started_utc": started_utc,
+                "notes": [
+                    "allowed_filings.json written",
+                    "sample_filing_fetch.json written",
+                    "run_metadata.json written",
+                    "audit_log.json written",
+                ],
+            },
+            indent=2,
+        ),
+    )
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
