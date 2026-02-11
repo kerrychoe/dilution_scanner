@@ -109,6 +109,14 @@ def master_idx_url_for_date(date_iso: str) -> str:
     return f"https://www.sec.gov/Archives/edgar/daily-index/{y}/QTR{qtr}/master.{yyyymmdd}.idx"
 
 
+def accession_from_filename(filename: str) -> str:
+    # filename example: "edgar/data/1045520/0001104659-26-009236.txt"
+    base = os.path.basename(filename)
+    if base.lower().endswith(".txt"):
+        return base[:-4]
+    return base
+
+
 def main():
     ensure_output_dir()
 
@@ -184,17 +192,108 @@ def main():
                 json.dumps(allowed_filings, indent=2),
             )
 
-            # --- Step 23/25/27: fetch a tiny deterministic sample + size cap + rules scan ---
+            # --- Step 28: full deterministic scan of ALL allowed filings ---
+            allowed_list = allowed_filings  # already sorted deterministically
+
+            matched_allowed = []
+            verbose_rows = []
+
+            # CSV header (date column first - locked preference)
+            verbose_header = (
+                "date,ticker,cik,company,form_type,accession,filing_url,free_float_shares,labels,matched_terms\n"
+            )
+
+            for item in allowed_list:
+                filing = FilingRef(
+                    cik=item["cik"],
+                    company=item["company"],
+                    form_type=item["form_type"],
+                    date_filed=item["date_filed"],
+                    filename=item["filename"],
+                    index_url=item["index_url"],
+                )
+
+                ok, content_bytes, err_str, http_status = fetch_primary_filing_text(
+                    filing=filing,
+                    user_agent=SEC_USER_AGENT,
+                )
+
+                bytes_len = (len(content_bytes) if content_bytes is not None else 0)
+
+                # Deterministic safety cap for full scan as well (same constant)
+                skipped_due_to_size = False
+                labels = []
+                matched_terms = []
+
+                if ok and content_bytes is not None:
+                    skipped_due_to_size = bytes_len > MAX_SAMPLE_BYTES
+
+                    if not skipped_due_to_size:
+                        filing_text = content_bytes.decode("utf-8", errors="replace")
+                        labels, matched_terms = scan_filing_text_for_labels(filing_text)
+
+                matched_allowed.append(
+                    {
+                        "cik": filing.cik,
+                        "company": filing.company,
+                        "form_type": filing.form_type,
+                        "date_filed": filing.date_filed,
+                        "filename": filing.filename,
+                        "index_url": filing.index_url,
+                        "fetch_ok": ok,
+                        "http_status": http_status,
+                        "bytes": bytes_len,
+                        "skipped_due_to_size": skipped_due_to_size,
+                        "labels": labels,
+                        "matched_terms": matched_terms,
+                        "error": err_str,
+                    }
+                )
+
+                # Only emit verbose CSV rows when there is at least one label match
+                if labels:
+                    date_val = target_date  # YYYY-MM-DD
+                    ticker_val = ""  # tickers not available yet (future step)
+                    accession = accession_from_filename(filing.filename)
+                    filing_url = filing.index_url
+                    free_float_shares = ""  # future phase
+                    labels_str = "|".join(labels)
+                    terms_str = "|".join(matched_terms)
+
+                    # Escape double quotes for CSV safety and wrap company field
+                    company_csv = '"' + filing.company.replace('"', '""') + '"'
+
+                    verbose_rows.append(
+                        f"{date_val},{ticker_val},{filing.cik},{company_csv},{filing.form_type},{accession},{filing_url},{free_float_shares},{labels_str},{terms_str}\n"
+                    )
+
+            # Write audit JSON of all scans (deterministic order preserved)
+            write_file_text(
+                f"{OUTPUT_DIR}/matched_allowed_filings.json",
+                json.dumps(matched_allowed, indent=2),
+            )
+
+            # Write verbose CSV (real rows)
+            write_file_text(
+                f"{OUTPUT_DIR}/dilution_tickers_verbose.csv",
+                verbose_header + "".join(verbose_rows),
+            )
+
+            # Ticker-only lists are empty until we add deterministic ticker resolution
+            write_file_text(f"{OUTPUT_DIR}/dilution_tickers.csv", "")
+            write_file_text(f"{OUTPUT_DIR}/dilution_tickers_all.csv", "")
+
+            # --- Keep sample fetch as-is (still useful for debugging) ---
             os.makedirs(f"{OUTPUT_DIR}/filings_raw", exist_ok=True)
 
             allowed_filings_path = f"{OUTPUT_DIR}/allowed_filings.json"
-            allowed_list = read_json_file(allowed_filings_path)
+            allowed_list_for_sample = read_json_file(allowed_filings_path)
 
             sample_n = 3  # deterministic small sample for smoke test
 
             sample = []
             seen_ciks = set()
-            for item in allowed_list:
+            for item in allowed_list_for_sample:
                 cik = item["cik"]
                 if cik in seen_ciks:
                     continue
@@ -263,19 +362,24 @@ def main():
                 f"{OUTPUT_DIR}/sample_filing_fetch.json",
                 json.dumps(sample_results, indent=2),
             )
+
         else:
             error = f"Non-200 or empty body (status={resp.status_code}, bytes={fetched_bytes_len})"
     except Exception as e:
         error = str(e)
 
-    # Placeholder outputs still created
-    write_file_text(
-        f"{OUTPUT_DIR}/dilution_tickers_verbose.csv",
-        "date,ticker,cik,company,form_type,accession,filing_url,free_float_shares,labels,matched_terms\n",
-    )
-    write_file_text(f"{OUTPUT_DIR}/dilution_tickers.csv", "")
-    write_file_text(f"{OUTPUT_DIR}/dilution_tickers_all.csv", "")
-    write_file_text(f"{OUTPUT_DIR}/audit_log.json", json.dumps([], indent=2))
+    # Placeholder outputs still created if master fetch fails
+    if not os.path.exists(f"{OUTPUT_DIR}/dilution_tickers_verbose.csv"):
+        write_file_text(
+            f"{OUTPUT_DIR}/dilution_tickers_verbose.csv",
+            "date,ticker,cik,company,form_type,accession,filing_url,free_float_shares,labels,matched_terms\n",
+        )
+    if not os.path.exists(f"{OUTPUT_DIR}/dilution_tickers.csv"):
+        write_file_text(f"{OUTPUT_DIR}/dilution_tickers.csv", "")
+    if not os.path.exists(f"{OUTPUT_DIR}/dilution_tickers_all.csv"):
+        write_file_text(f"{OUTPUT_DIR}/dilution_tickers_all.csv", "")
+    if not os.path.exists(f"{OUTPUT_DIR}/audit_log.json"):
+        write_file_text(f"{OUTPUT_DIR}/audit_log.json", json.dumps([], indent=2))
 
     run_meta = {
         "run_timestamp_utc": run_time,
@@ -296,7 +400,7 @@ def main():
             "saved_path": "output/master.idx" if fetch_ok else None,
             "error_body_preview_path": "output/master_idx_error_body.txt" if not fetch_ok else None,
         },
-        "status": "step27_sample_filing_fetch_rules_scan",
+        "status": "step28_full_allowed_filings_scan",
     }
 
     write_file_text(f"{OUTPUT_DIR}/run_metadata.json", json.dumps(run_meta, indent=2))
