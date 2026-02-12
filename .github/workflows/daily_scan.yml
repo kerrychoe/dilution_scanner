@@ -40,6 +40,10 @@ jobs:
         env:
           START_DATE: ${{ github.event.inputs.start_date }}
           END_DATE: ${{ github.event.inputs.end_date }}
+
+          # Massive float gate (NO apiKey in URL)
+          MASSIVE_FLOAT_URL_TEMPLATE: "https://api.massive.com/stocks/vX/float?ticker={ticker}&limit=100&sort=ticker.asc"
+          MASSIVE_API_KEY: ${{ secrets.MASSIVE_API_KEY }}
         run: |
           python -m dilution_scanner
 
