@@ -13,18 +13,15 @@ OUTPUT_DIR = "output"
 # Deterministic cap for filings we parse/scan
 MAX_SAMPLE_BYTES = 2_000_000  # 2 MB
 
-# FLOAT GATE (LOCKED by your policy choice)
+# FLOAT GATE (LOCKED)
 FLOAT_MAX_SHARES = 10_000_000
 FLOAT_GATE_POLICY = "strict_tradeable_only"  # locked
 
+# STALE PRUNE (LOCKED)
+STALE_DAYS = 180
+
 # LOCKED form allowlist (deterministic)
-ALLOWED_FORMS = [
-    "424B",
-    "S-3",
-    "S-1",
-    "F-3",
-    "8-K",
-]
+ALLOWED_FORMS = ["424B", "S-3", "S-1", "F-3", "8-K"]
 
 # SEC requires a descriptive User-Agent with real contact email
 SEC_USER_AGENT = "DilutionTickerScanner/1.0 (contact: kerrychoe@gmail.com)"
@@ -44,11 +41,26 @@ VERBOSE_COLUMNS = [
     "matched_terms",
 ]
 
-# Massive Float Gate artifacts
+# Float Gate artifacts
 FLOAT_CACHE_PATH = f"{OUTPUT_DIR}/float_cache.json"
 FLOAT_PASS_CSV = f"{OUTPUT_DIR}/float_gate_pass.csv"
 FLOAT_FAIL_CSV = f"{OUTPUT_DIR}/float_gate_fail.csv"
 FLOAT_UNKNOWN_CSV = f"{OUTPUT_DIR}/float_gate_unknown.csv"
+
+# Persistent aggregate artifacts (repo root persisted; output written each run)
+ALL_TICKERS_ROOT = "dilution_tickers_all.csv"
+ALL_VERBOSE_ROOT = "dilution_tickers_all_verbose.csv"
+ALL_TICKERS_OUT = f"{OUTPUT_DIR}/dilution_tickers_all.csv"
+ALL_VERBOSE_OUT = f"{OUTPUT_DIR}/dilution_tickers_all_verbose.csv"
+
+ALL_VERBOSE_COLUMNS = [
+    "ticker",
+    "first_seen_date",
+    "last_seen_date",
+    "seen_count",
+    "last_labels",
+    "last_filing_url",
+]
 
 
 def ensure_output_dir():
@@ -90,10 +102,6 @@ def parse_dates():
 
 
 def iter_date_range_inclusive(start_iso: str, end_iso: str) -> list[str]:
-    """
-    Deterministic inclusive date iteration.
-    Returns list of YYYY-MM-DD strings in ascending order.
-    """
     s = date.fromisoformat(start_iso)
     e = date.fromisoformat(end_iso)
     if e < s:
@@ -108,12 +116,6 @@ def iter_date_range_inclusive(start_iso: str, end_iso: str) -> list[str]:
 
 
 def sec_get(url: str, timeout_sec: int = 30) -> requests.Response:
-    """
-    Deterministic SEC GET:
-    - Fixed identifying headers (User-Agent + From)
-    - Identity encoding (no compression)
-    - Basic retry with fixed backoff
-    """
     headers = {
         "User-Agent": SEC_USER_AGENT,
         "From": SEC_CONTACT_EMAIL,
@@ -125,13 +127,13 @@ def sec_get(url: str, timeout_sec: int = 30) -> requests.Response:
     }
 
     last_exc = None
-    for attempt in range(1, 4):  # 3 attempts max
+    for attempt in range(1, 4):
         try:
             resp = requests.get(url, headers=headers, timeout=timeout_sec)
             return resp
         except Exception as e:
             last_exc = e
-            time.sleep(attempt)  # fixed backoff: 1s,2s,3s
+            time.sleep(attempt)
 
     raise RuntimeError(f"SEC GET failed after 3 attempts: {url}") from last_exc
 
@@ -160,9 +162,6 @@ def normalize_cik(cik_str: str) -> str:
 
 
 def csv_escape(value) -> str:
-    """
-    Stable CSV escaping.
-    """
     if value is None:
         s = ""
     else:
@@ -189,7 +188,8 @@ def new_audit(run_time_utc: str, start_date: str, end_date: str, date_mode: str)
         "counts": {},
         "by_date": [],
         "error_samples": [],
-        "float_gate": {},  # range-level float gate summary
+        "float_gate": {},
+        "stale_prune": {},
     }
 
 
@@ -197,6 +197,9 @@ def audit_event(audit: dict, event: str, data: dict | None = None):
     audit["events"].append({"event": event, "data": (data or {})})
 
 
+# -----------------------------
+# CIK -> TICKER MAP
+# -----------------------------
 def _parse_company_tickers_json(raw_bytes: bytes) -> dict:
     data = json.loads(raw_bytes.decode("utf-8", errors="replace"))
     if isinstance(data, dict):
@@ -281,6 +284,9 @@ def load_cik_to_ticker_map_dual_source() -> tuple:
     return combined, meta
 
 
+# -----------------------------
+# TICKER LIST HELPERS
+# -----------------------------
 def read_ticker_list(path: str) -> list:
     if not os.path.exists(path):
         return []
@@ -299,7 +305,120 @@ def write_ticker_list(path: str, tickers: list):
 
 
 # -----------------------------
-# MASSIVE FLOAT GATE (DETERMINISTIC)
+# PERSISTENT ALL-VERBOSE (SOURCE OF TRUTH)
+# -----------------------------
+def _parse_all_verbose_csv(path: str) -> dict:
+    """
+    Returns dict[ticker] = record dict (columns in ALL_VERBOSE_COLUMNS)
+    Deterministic: ignores unknown columns; last duplicate row wins (stable due to file order).
+    """
+    if not os.path.exists(path):
+        return {}
+
+    with open(path, "r", encoding="utf-8") as f:
+        lines = f.read().splitlines()
+
+    if not lines:
+        return {}
+
+    header = lines[0].split(",")
+    idx = {name: i for i, name in enumerate(header)}
+
+    out = {}
+    for line in lines[1:]:
+        if not line.strip():
+            continue
+        # Minimal CSV parsing (values in our file contain no commas except possibly labels/url;
+        # we avoid commas by using | in labels and plain URL. Still, for safety, handle quoted commas naively.)
+        parts = []
+        cur = ""
+        in_q = False
+        i = 0
+        while i < len(line):
+            ch = line[i]
+            if ch == '"' and (i == 0 or line[i - 1] != "\\"):
+                # CSV quotes: toggle unless doubled quote
+                if in_q and i + 1 < len(line) and line[i + 1] == '"':
+                    cur += '"'
+                    i += 2
+                    continue
+                in_q = not in_q
+                i += 1
+                continue
+            if ch == "," and not in_q:
+                parts.append(cur)
+                cur = ""
+                i += 1
+                continue
+            cur += ch
+            i += 1
+        parts.append(cur)
+
+        ticker = ""
+        if "ticker" in idx and idx["ticker"] < len(parts):
+            ticker = parts[idx["ticker"]].strip().upper()
+        if not ticker:
+            continue
+
+        rec = {}
+        for col in ALL_VERBOSE_COLUMNS:
+            v = ""
+            if col in idx and idx[col] < len(parts):
+                v = parts[idx[col]].strip()
+            rec[col] = v
+        out[ticker] = rec
+
+    return out
+
+
+def _write_all_verbose_csv(path: str, records: dict):
+    """
+    records: dict[ticker] -> rec
+    Deterministic ordering: ticker ascending
+    """
+    lines = [",".join(ALL_VERBOSE_COLUMNS) + "\n"]
+    for tkr in sorted(records.keys()):
+        rec = records[tkr]
+        row = []
+        for col in ALL_VERBOSE_COLUMNS:
+            row.append(csv_escape(rec.get(col, "")))
+        lines.append(",".join(row) + "\n")
+    write_file_text(path, "".join(lines))
+
+
+def _iso_today_from_end_date(end_date_iso: str) -> str:
+    return end_date_iso
+
+
+def _date_to_obj(d: str) -> date | None:
+    try:
+        return date.fromisoformat(d)
+    except Exception:
+        return None
+
+
+def _safe_int(x):
+    try:
+        if x is None:
+            return None
+        if isinstance(x, bool):
+            return None
+        if isinstance(x, int):
+            return int(x)
+        if isinstance(x, float):
+            return int(x)
+        s = str(x).strip().replace(",", "")
+        if not s:
+            return None
+        if "." in s:
+            s = s.split(".", 1)[0]
+        return int(s)
+    except Exception:
+        return None
+
+
+# -----------------------------
+# MASSIVE FLOAT GATE
 # -----------------------------
 def load_float_cache() -> dict:
     if not os.path.exists(FLOAT_CACHE_PATH):
@@ -308,23 +427,14 @@ def load_float_cache() -> dict:
         obj = read_json_file(FLOAT_CACHE_PATH)
         return obj if isinstance(obj, dict) else {}
     except Exception:
-        # Deterministic fallback: ignore unreadable cache
         return {}
 
 
 def save_float_cache(cache: dict):
-    # Deterministic key order by sorting in dumps
     write_file_text(FLOAT_CACHE_PATH, json.dumps(cache, indent=2, sort_keys=True))
 
 
 def massive_get_float_records(ticker: str) -> tuple[bool, dict | None, str | None]:
-    """
-    Deterministic Massive float fetch.
-    Requires env vars:
-      MASSIVE_FLOAT_URL_TEMPLATE  (example: https://api.massive.com/.../getStockFloatVX?ticker={ticker})
-      MASSIVE_API_KEY            (token)
-    Returns: (ok, json_obj, error_str)
-    """
     url_template = os.getenv("MASSIVE_FLOAT_URL_TEMPLATE", "").strip()
     api_key = os.getenv("MASSIVE_API_KEY", "").strip()
 
@@ -337,8 +447,7 @@ def massive_get_float_records(ticker: str) -> tuple[bool, dict | None, str | Non
         "Accept": "application/json",
         "Accept-Encoding": "identity",
         "Connection": "close",
-        # Keep deterministic header names; token style may vary by your Massive account
-        "Authorization": f"Bearer {api_key}",
+        "Authorization": f"Bearer {api_key}",  # Massive supports this, per your docs
         "User-Agent": "DilutionTickerScanner/1.0",
     }
 
@@ -360,10 +469,6 @@ def massive_get_float_records(ticker: str) -> tuple[bool, dict | None, str | Non
 
 
 def _extract_effective_date_str(obj: dict) -> str:
-    """
-    Return effective date string if present.
-    Accepts keys like: effective_date, effectiveDate, date, asOfDate
-    """
     for k in ["effective_date", "effectiveDate", "asOfDate", "as_of_date", "date", "dt"]:
         v = obj.get(k)
         if isinstance(v, str) and v.strip():
@@ -371,31 +476,7 @@ def _extract_effective_date_str(obj: dict) -> str:
     return ""
 
 
-def _safe_int(x):
-    try:
-        if x is None:
-            return None
-        if isinstance(x, bool):
-            return None
-        if isinstance(x, (int,)):
-            return int(x)
-        if isinstance(x, float):
-            return int(x)
-        s = str(x).strip().replace(",", "")
-        if not s:
-            return None
-        # allow "123.0"
-        if "." in s:
-            s = s.split(".", 1)[0]
-        return int(s)
-    except Exception:
-        return None
-
-
 def _extract_float_shares(obj: dict) -> int | None:
-    """
-    Try common keys for free float shares.
-    """
     keys = [
         "free_float_shares",
         "freeFloatShares",
@@ -415,14 +496,6 @@ def _extract_float_shares(obj: dict) -> int | None:
 
 
 def pick_float_from_massive_response(resp_obj: dict) -> tuple[int | None, str, list[dict]]:
-    """
-    Deterministically select ONE float value from Massive response.
-    Strategy:
-      - find list under common keys: results, data, floats, records
-      - consider each record with (float_shares, effective_date_str)
-      - pick record with max (parsed_effective_date, float_shares) as tiebreaker
-    Returns: (float_shares_or_none, effective_date_str, records_considered)
-    """
     candidates = []
 
     def add_record(rec):
@@ -433,25 +506,17 @@ def pick_float_from_massive_response(resp_obj: dict) -> tuple[int | None, str, l
         candidates.append({"float_shares": fs, "effective_date": eds, "raw": rec})
 
     if isinstance(resp_obj, dict):
-        # Common containers
         for key in ["results", "data", "floats", "records", "items"]:
             v = resp_obj.get(key)
             if isinstance(v, list):
                 for rec in v:
                     add_record(rec)
-
-        # If response itself looks like a single record
         if not candidates:
             add_record(resp_obj)
 
-    # parse effective date for sorting (deterministic)
     def parse_date(dstr: str):
         if not dstr:
             return "0000-00-00"
-        # normalize a few common formats:
-        # - YYYY-MM-DD
-        # - YYYYMMDD
-        # - YYYY-MM-DDTHH:MM:SSZ
         s = dstr.strip()
         if len(s) >= 10 and s[4] == "-" and s[7] == "-":
             return s[:10]
@@ -463,7 +528,6 @@ def pick_float_from_massive_response(resp_obj: dict) -> tuple[int | None, str, l
                 return head
         return "0000-00-00"
 
-    # Filter to those with known float shares
     valid = []
     for c in candidates:
         fs = c.get("float_shares")
@@ -475,7 +539,6 @@ def pick_float_from_massive_response(resp_obj: dict) -> tuple[int | None, str, l
     if not valid:
         return None, "", candidates
 
-    # Max by (effective_date, float_shares) to break ties deterministically
     valid.sort(key=lambda t: (t[0], t[1]))
     best = valid[-1]
     return best[1], best[0], candidates
@@ -534,13 +597,11 @@ def main():
     total_allowed_rows = 0
     total_matched_rows = 0
     total_blank_ticker_rows = 0
-
     total_scan_fetch_fail = 0
     total_scan_skipped_due_to_size = 0
     total_scan_scanned = 0
 
     label_counts_total = {}
-
     verbose_rows_all = []
     run_tickers_all = []
 
@@ -548,23 +609,15 @@ def main():
     matched_allowed_all = []
 
     error_rows_all = []
-    ERROR_SAMPLE_LIMIT = 25
 
     # -----------------------------
-    # PASS 1: Build candidate tickers across entire date range
-    # (deterministic: dates asc, within day stable sort, then tickers sorted)
+    # PASS 1: Build candidate tickers across entire range
     # -----------------------------
     audit_event(audit, "float_gate_pass1_start", {"policy": FLOAT_GATE_POLICY, "float_max_shares": FLOAT_MAX_SHARES})
 
     candidate_ticker_set = set()
     candidate_ticker_sources = 0
     blank_ticker_candidates = 0
-
-    # We also store per-day allowed filings to avoid refetching master.idx later is possible,
-    # but to keep changes minimal and deterministic, we will do a "two-pass" master.idx fetch.
-    # PASS 1 builds the candidate ticker list; PASS 2 re-fetches and scans only passing tickers.
-    # This is deterministic and still reduces SEC filing fetch load significantly.
-    # (Master.idx is small compared to filings.)
 
     for target_date in dates:
         url = master_idx_url_for_date(target_date)
@@ -580,7 +633,6 @@ def main():
                 if r.form_type in ("S-1", "S-3", "F-3", "8-K") or r.form_type.startswith("424B"):
                     allowed_rows.append(r)
 
-            # Stable ordering within day
             allowed_rows.sort(key=lambda r: (r.form_type, r.cik, r.filename))
 
             for r in allowed_rows:
@@ -607,7 +659,7 @@ def main():
     )
 
     # -----------------------------
-    # Float gate lookup (cache + API)
+    # Float gate lookup (no persistence required; cache only within run)
     # -----------------------------
     float_cache = load_float_cache()
     float_gate_api_calls = 0
@@ -615,11 +667,9 @@ def main():
     pass_rows = []
     fail_rows = []
     unknown_rows = []
-
     pass_tickers = set()
 
     for tkr in candidate_tickers:
-        # Cache hit?
         cached = float_cache.get(tkr)
         if isinstance(cached, dict) and "float_shares" in cached and "effective_date" in cached and "status" in cached:
             status = str(cached.get("status", "")).strip()
@@ -637,18 +687,11 @@ def main():
                 unknown_rows.append({"ticker": tkr, "float_shares": (fs if fs is not None else ""), "effective_date": ed, "status": "unknown", "source": source, "error": err})
             continue
 
-        # Cache miss => API call
         ok, obj, err = massive_get_float_records(tkr)
         float_gate_api_calls += 1
 
         if not ok or obj is None:
-            # Strict policy: unknown => treated as unknown (and will be skipped in PASS 2)
-            float_cache[tkr] = {
-                "status": "unknown",
-                "float_shares": None,
-                "effective_date": "",
-                "error": (err or "unknown_error"),
-            }
+            float_cache[tkr] = {"status": "unknown", "float_shares": None, "effective_date": "", "error": (err or "unknown_error")}
             unknown_rows.append({"ticker": tkr, "float_shares": "", "effective_date": "", "status": "unknown", "source": "api", "error": (err or "")})
             continue
 
@@ -666,7 +709,6 @@ def main():
             float_cache[tkr] = {"status": "fail", "float_shares": fs, "effective_date": ed, "error": ""}
             fail_rows.append({"ticker": tkr, "float_shares": fs, "effective_date": ed, "status": "fail", "source": "api", "error": ""})
 
-    # Save cache + reporting artifacts deterministically
     save_float_cache(float_cache)
     write_file_text(FLOAT_PASS_CSV, csv_lines_for_float_gate(sorted(pass_rows, key=lambda r: r["ticker"])))
     write_file_text(FLOAT_FAIL_CSV, csv_lines_for_float_gate(sorted(fail_rows, key=lambda r: r["ticker"])))
@@ -700,8 +742,7 @@ def main():
     )
 
     # -----------------------------
-    # PASS 2: Full scan, but ONLY for filings whose ticker is in pass_tickers
-    # Strict policy: if ticker blank OR not in pass_tickers => skip filing scan
+    # PASS 2: Scan filings ONLY for pass_tickers
     # -----------------------------
     for target_date in dates:
         url = master_idx_url_for_date(target_date)
@@ -764,10 +805,8 @@ def main():
 
             audit_event(audit, "master_idx_parsed", {"date": target_date, "parsed_rows": parsed_row_count, "allowed_rows": allowed_row_count})
 
-            # Stable ordering within date
             allowed_rows.sort(key=lambda r: (r.form_type, r.cik, r.filename))
 
-            # Build allowed filings and apply float gate filter (ticker must exist and be in pass_tickers)
             allowed_filings = []
             float_gate_skipped = 0
 
@@ -884,7 +923,6 @@ def main():
                         label_counts_day[lab] = label_counts_day.get(lab, 0) + 1
                         label_counts_total[lab] = label_counts_total.get(lab, 0) + 1
 
-                    # Fill free_float_shares from cache (deterministic)
                     free_float_shares = ""
                     cached = float_cache.get(ticker_val)
                     if isinstance(cached, dict):
@@ -953,7 +991,7 @@ def main():
             continue
 
     # -----------------------------
-    # WRITE OUTPUTS
+    # WRITE RANGE OUTPUTS
     # -----------------------------
     write_file_text(f"{OUTPUT_DIR}/allowed_filings.json", json.dumps(allowed_filings_all, indent=2))
     write_file_text(f"{OUTPUT_DIR}/matched_allowed_filings.json", json.dumps(matched_allowed_all, indent=2))
@@ -963,10 +1001,144 @@ def main():
 
     write_ticker_list(f"{OUTPUT_DIR}/dilution_tickers.csv", run_tickers_all)
 
-    all_path = f"{OUTPUT_DIR}/dilution_tickers_all.csv"
-    prior_all = read_ticker_list(all_path)
-    write_ticker_list(all_path, prior_all + run_tickers_all)
+    # -----------------------------
+    # PERSISTENT MASTER (VERBOSE) + STALE PRUNE
+    # Source of truth: dilution_tickers_all_verbose.csv (repo root)
+    # Derived: dilution_tickers_all.csv (ticker-only, pruned)
+    # -----------------------------
+    # Load existing verbose master from repo root if present; else from output; else empty
+    prior_verbose = {}
+    if os.path.exists(ALL_VERBOSE_ROOT):
+        prior_verbose = _parse_all_verbose_csv(ALL_VERBOSE_ROOT)
+        prior_source = "repo_root"
+    elif os.path.exists(ALL_VERBOSE_OUT):
+        prior_verbose = _parse_all_verbose_csv(ALL_VERBOSE_OUT)
+        prior_source = "output"
+    else:
+        prior_verbose = {}
+        prior_source = "none"
 
+    # Build run-level per-ticker updates from matched_allowed_all (deterministic)
+    # We only consider rows with labels and non-empty ticker (strict policy ensures this)
+    run_updates = {}  # ticker -> {last_seen_date, last_labels, last_filing_url, seen_increment}
+    for r in matched_allowed_all:
+        labels = r.get("labels") or []
+        tkr = str(r.get("ticker") or "").strip().upper()
+        filing_date = str(r.get("date") or "").strip()
+        filing_url = str(r.get("index_url") or "").strip()
+        if not tkr or not labels:
+            continue
+        lab_str = "|".join(labels)
+
+        u = run_updates.get(tkr)
+        if u is None:
+            run_updates[tkr] = {
+                "last_seen_date": filing_date,
+                "last_labels": lab_str,
+                "last_filing_url": filing_url,
+                "seen_increment": 1,
+            }
+        else:
+            # last_seen_date = max date (ISO sortable)
+            if filing_date and filing_date > u["last_seen_date"]:
+                u["last_seen_date"] = filing_date
+                u["last_labels"] = lab_str
+                u["last_filing_url"] = filing_url
+            u["seen_increment"] += 1
+
+    # Merge into master
+    merged = dict(prior_verbose)
+    for tkr in sorted(run_updates.keys()):
+        upd = run_updates[tkr]
+        existing = merged.get(tkr)
+        if existing is None:
+            merged[tkr] = {
+                "ticker": tkr,
+                "first_seen_date": upd["last_seen_date"],
+                "last_seen_date": upd["last_seen_date"],
+                "seen_count": str(upd["seen_increment"]),
+                "last_labels": upd["last_labels"],
+                "last_filing_url": upd["last_filing_url"],
+            }
+        else:
+            first_seen = existing.get("first_seen_date", "") or upd["last_seen_date"]
+            last_seen = existing.get("last_seen_date", "")
+            if not last_seen or upd["last_seen_date"] > last_seen:
+                last_seen = upd["last_seen_date"]
+                existing["last_labels"] = upd["last_labels"]
+                existing["last_filing_url"] = upd["last_filing_url"]
+
+            sc = _safe_int(existing.get("seen_count"))
+            if sc is None:
+                sc = 0
+            sc += int(upd["seen_increment"])
+            merged[tkr] = {
+                "ticker": tkr,
+                "first_seen_date": first_seen,
+                "last_seen_date": last_seen,
+                "seen_count": str(sc),
+                "last_labels": existing.get("last_labels", ""),
+                "last_filing_url": existing.get("last_filing_url", ""),
+            }
+
+    # Prune stale: last_seen_date < (END_DATE - STALE_DAYS)
+    end_obj = _date_to_obj(end_date)
+    cutoff_obj = (end_obj - timedelta(days=STALE_DAYS)) if end_obj else None
+    cutoff_iso = cutoff_obj.isoformat() if cutoff_obj else ""
+
+    before_count = len(merged)
+    removed = []
+    kept = {}
+
+    for tkr in sorted(merged.keys()):
+        rec = merged[tkr]
+        last_seen = rec.get("last_seen_date", "").strip()
+        last_obj = _date_to_obj(last_seen)
+        if cutoff_obj and last_obj and last_obj < cutoff_obj:
+            removed.append(tkr)
+        elif cutoff_obj and (not last_obj):
+            # deterministic: if last_seen_date is missing/unparseable, drop (strict hygiene)
+            removed.append(tkr)
+        else:
+            kept[tkr] = rec
+
+    after_count = len(kept)
+
+    # Write pruned verbose master to output
+    _write_all_verbose_csv(ALL_VERBOSE_OUT, kept)
+
+    # Derived pruned ticker-only list
+    active_tickers = sorted(kept.keys())
+    write_ticker_list(ALL_TICKERS_OUT, active_tickers)
+
+    audit["stale_prune"] = {
+        "stale_days": STALE_DAYS,
+        "end_date": end_date,
+        "cutoff_date_inclusive": cutoff_iso,
+        "prior_source": prior_source,
+        "prior_master_count": len(prior_verbose),
+        "merged_master_count": before_count,
+        "removed_stale_count": len(removed),
+        "active_master_count": after_count,
+    }
+
+    audit_event(
+        audit,
+        "all_tickers_master_updated",
+        {
+            "stale_days": STALE_DAYS,
+            "cutoff_date": cutoff_iso,
+            "prior_source": prior_source,
+            "prior_master_count": len(prior_verbose),
+            "merged_master_count": before_count,
+            "removed_stale_count": len(removed),
+            "active_master_count": after_count,
+        },
+    )
+
+    # -----------------------------
+    # LABEL SUMMARY + AUDIT
+    # -----------------------------
     summary = {
         "start_date": start_date,
         "end_date": end_date,
@@ -974,6 +1146,7 @@ def main():
         "blank_ticker_rows": total_blank_ticker_rows,
         "label_counts": {k: label_counts_total[k] for k in sorted(label_counts_total.keys())},
         "float_gate": audit.get("float_gate", {}),
+        "stale_prune": audit.get("stale_prune", {}),
     }
     write_file_text(f"{OUTPUT_DIR}/label_summary.json", json.dumps(summary, indent=2))
 
@@ -981,12 +1154,6 @@ def main():
     for k in sorted(label_counts_total.keys()):
         summary_csv_lines.append(f"{csv_escape(k)},{label_counts_total[k]}\n")
     write_file_text(f"{OUTPUT_DIR}/label_summary.csv", "".join(summary_csv_lines))
-
-    error_rows_sorted = sorted(
-        error_rows_all,
-        key=lambda x: (x.get("date", ""), x.get("form_type", ""), x.get("cik", ""), x.get("filename", "")),
-    )
-    audit["error_samples"] = error_rows_sorted[:25]
 
     audit["counts"] = {
         "parsed_rows": total_parsed_rows,
@@ -1011,12 +1178,13 @@ def main():
             "skipped_due_to_size": total_scan_skipped_due_to_size,
             "scanned": total_scan_scanned,
             "float_gate": audit.get("float_gate", {}),
+            "stale_prune": audit.get("stale_prune", {}),
         },
     )
 
     write_file_text(f"{OUTPUT_DIR}/audit_log.json", json.dumps(audit, indent=2))
 
-    # Keep sample fetch (deterministic: first 3 unique CIKs from allowed_filings_all)
+    # Sample fetch kept (unchanged)
     os.makedirs(f"{OUTPUT_DIR}/filings_raw", exist_ok=True)
     sample_n = 3
     sample = []
@@ -1088,27 +1256,17 @@ def main():
         "scan_days": dates,
         "allowed_forms": ALLOWED_FORMS,
         "sec_user_agent": SEC_USER_AGENT,
-        "cik_ticker_map": {"ok": cik_map_ok, "error": cik_map_error, "meta": cik_map_meta},
         "float_gate": audit.get("float_gate", {}),
-        "range_totals": {
-            "master_idx_parsed_rows": total_parsed_rows,
-            "master_idx_allowed_rows": total_allowed_rows,
-            "matched_rows": total_matched_rows,
-            "blank_ticker_rows": total_blank_ticker_rows,
-            "scan_fetch_fail": total_scan_fetch_fail,
-            "scan_skipped_due_to_size": total_scan_skipped_due_to_size,
-            "scan_scanned": total_scan_scanned,
-        },
-        "status": "float_gate_v1_strict_tradeable_only",
+        "stale_prune": audit.get("stale_prune", {}),
+        "range_totals": audit.get("counts", {}),
+        "status": "stale_prune_v1_all_verbose",
     }
     write_file_text(f"{OUTPUT_DIR}/run_metadata.json", json.dumps(run_meta, indent=2))
 
     print(f"Scan range: {start_date} .. {end_date} (days={len(dates)})")
     print(f"Float gate: policy={FLOAT_GATE_POLICY}, max_shares={FLOAT_MAX_SHARES}")
-    print(f"Float gate: candidates={len(candidate_tickers)}, pass={len(pass_tickers)}, fail={len(fail_rows)}, unknown={len(unknown_rows)}, api_calls={float_gate_api_calls}")
-    print(f"Parsed rows={total_parsed_rows}, Allowed rows={total_allowed_rows}")
-    print(f"Matched rows={total_matched_rows}, Blank ticker rows={total_blank_ticker_rows}")
-    print(f"Scan fetch fail={total_scan_fetch_fail}, skipped_due_to_size={total_scan_skipped_due_to_size}, scanned={total_scan_scanned}")
+    sp = audit.get("stale_prune", {})
+    print(f"Stale prune: stale_days={STALE_DAYS}, cutoff={sp.get('cutoff_date_inclusive')}, active_master={sp.get('active_master_count')}, removed={sp.get('removed_stale_count')}")
 
 
 if __name__ == "__main__":
