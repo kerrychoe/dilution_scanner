@@ -2,7 +2,6 @@ name: Daily Dilution Scan
 
 on:
   schedule:
-    # Runs daily at 12:15 UTC (adjust later if you want a different time)
     - cron: "15 12 * * *"
   workflow_dispatch:
     inputs:
@@ -41,7 +40,6 @@ jobs:
           START_DATE: ${{ github.event.inputs.start_date }}
           END_DATE: ${{ github.event.inputs.end_date }}
 
-          # Massive float gate (NO apiKey in URL)
           MASSIVE_FLOAT_URL_TEMPLATE: "https://api.massive.com/stocks/vX/float?ticker={ticker}&limit=100&sort=ticker.asc"
           MASSIVE_API_KEY: ${{ secrets.MASSIVE_API_KEY }}
         run: |
@@ -54,16 +52,26 @@ jobs:
           path: output/**
           if-no-files-found: error
 
-      - name: Commit updated master list
+      - name: Commit updated persistent lists
         run: |
+          set -e
+
+          # ticker-only master (pruned)
           if [ -f output/dilution_tickers_all.csv ]; then
             cp output/dilution_tickers_all.csv dilution_tickers_all.csv
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add dilution_tickers_all.csv
-            git diff --cached --quiet && echo "No changes to commit." && exit 0
-            git commit -m "Update dilution_tickers_all.csv"
-            git push
-          else
-            echo "output/dilution_tickers_all.csv not found; nothing to commit."
           fi
+
+          # verbose master (pruned + stateful)
+          if [ -f output/dilution_tickers_all_verbose.csv ]; then
+            cp output/dilution_tickers_all_verbose.csv dilution_tickers_all_verbose.csv
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add dilution_tickers_all.csv dilution_tickers_all_verbose.csv
+
+          git diff --cached --quiet && echo "No changes to commit." && exit 0
+
+          git commit -m "Update dilution tickers master lists (pruned)"
+          git push
