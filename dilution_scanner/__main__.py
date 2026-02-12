@@ -2,11 +2,13 @@ import os
 import json
 import time
 import requests
-from datetime import datetime, timedelta, timezone, date
 
+from datetime import datetime, timedelta, timezone, date
 from dilution_scanner.master_idx_parser import parse_master_idx
 from dilution_scanner.filings import FilingRef, fetch_primary_filing_text, filing_artifact_basename
 from dilution_scanner.rules import scan_filing_text_for_labels
+
+SYSTEM_VERSION = "1.0.0"
 
 OUTPUT_DIR = "output"
 
@@ -1249,6 +1251,7 @@ def main():
     write_file_text(f"{OUTPUT_DIR}/sample_filing_fetch.json", json.dumps(sample_results, indent=2))
 
     run_meta = {
+        "system_version": SYSTEM_VERSION,        
         "run_timestamp_utc": run_time,
         "scan_start_date": start_date,
         "scan_end_date": end_date,
