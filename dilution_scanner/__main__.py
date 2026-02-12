@@ -14,7 +14,7 @@ OUTPUT_DIR = "output"
 MAX_SAMPLE_BYTES = 2_000_000  # 2 MB
 
 # FLOAT GATE (LOCKED by your policy choice)
-FLOAT_MAX_SHARES = 20_000_000
+FLOAT_MAX_SHARES = 10_000_000
 FLOAT_GATE_POLICY = "strict_tradeable_only"  # locked
 
 # LOCKED form allowlist (deterministic)
