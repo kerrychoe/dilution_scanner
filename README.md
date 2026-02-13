@@ -1,4 +1,4 @@
-# DilutionTicker Scanner
+# Dilution Scanner
 
 ## Version 1.0.0
 
