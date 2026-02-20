@@ -13,7 +13,7 @@ AIM,2026-01-20,2026-02-17,4,convert_financing|dilution_bank,https://www.sec.gov/
 AIRI,2026-02-17,2026-02-17,1,convert_financing|dilution_bank|pipe_financing,https://www.sec.gov/Archives/edgar/data/1009891/0001213900-26-016863.txt
 AIXC,2026-02-02,2026-02-17,7,dilution_bank|pipe_financing,https://www.sec.gov/Archives/edgar/data/1460702/0001493152-26-007102.txt
 AKAN,2026-01-21,2026-01-21,2,convert_financing|dilution_bank|pipe_financing,https://www.sec.gov/Archives/edgar/data/1888014/0001213900-26-006025.txt
-ALBT,2026-02-02,2026-02-18,7,dilution_bank,https://www.sec.gov/Archives/edgar/data/1630212/0001213900-26-017682.txt
+ALBT,2026-02-02,2026-02-19,8,dilution_bank,https://www.sec.gov/Archives/edgar/data/1630212/0001213900-26-018475.txt
 ALCO,2026-02-04,2026-02-04,2,dilution_bank,https://www.sec.gov/Archives/edgar/data/3545/0000003545-26-000010.txt
 AMIX,2025-12-12,2025-12-12,3,convert_financing|dilution_bank|pipe_financing,https://www.sec.gov/Archives/edgar/data/1617867/0001437749-25-037748.txt
 AMZE,2026-02-11,2026-02-12,10,convert_financing|dilution_bank|pipe_financing,https://www.sec.gov/Archives/edgar/data/1880343/0001493152-26-006456.txt
@@ -63,7 +63,7 @@ CBK,2026-01-28,2026-01-28,1,dilution_bank,https://www.sec.gov/Archives/edgar/dat
 CELZ,2025-12-16,2025-12-16,2,dilution_bank|pipe_financing,https://www.sec.gov/Archives/edgar/data/1187953/0001477932-25-008989.txt
 CETY,2026-01-16,2026-01-16,4,dilution_bank,https://www.sec.gov/Archives/edgar/data/1329606/0001493152-26-002624.txt
 CHMG,2026-01-26,2026-01-26,1,convert_financing,https://www.sec.gov/Archives/edgar/data/763563/0001171843-26-000415.txt
-CISS,2026-01-26,2026-01-26,10,convert_financing,https://www.sec.gov/Archives/edgar/data/1951067/0001193125-26-022549.txt
+CISS,2026-01-26,2026-02-19,14,convert_financing,https://www.sec.gov/Archives/edgar/data/1951067/0001193125-26-058273.txt
 CKX,2025-11-20,2025-11-20,1,dilution_bank,https://www.sec.gov/Archives/edgar/data/352955/0001437749-25-035779.txt
 CLGN,2026-02-06,2026-02-06,2,convert_financing|dilution_bank|pipe_financing,https://www.sec.gov/Archives/edgar/data/1631487/0001213900-26-013033.txt
 CLIK,2025-12-22,2025-12-22,1,dilution_bank|pipe_financing,https://www.sec.gov/Archives/edgar/data/2020027/0001493152-25-028640.txt
@@ -73,7 +73,7 @@ CMCT,2026-01-22,2026-01-22,3,dilution_bank,https://www.sec.gov/Archives/edgar/da
 CMND,2025-12-03,2026-02-17,5,convert_financing|dilution_bank|pipe_financing,https://www.sec.gov/Archives/edgar/data/1892500/0001213900-26-017379.txt
 CNEY,2025-12-22,2025-12-22,1,convert_financing|dilution_bank|pipe_financing,https://www.sec.gov/Archives/edgar/data/1780785/0001477932-25-009114.txt
 CNSP,2025-11-21,2025-11-21,1,dilution_bank,https://www.sec.gov/Archives/edgar/data/1729427/0001683168-25-008624.txt
-COCP,2025-12-01,2025-12-01,2,dilution_bank,https://www.sec.gov/Archives/edgar/data/1412486/0001493152-25-025568.txt
+COCP,2025-12-01,2026-02-19,3,dilution_bank,https://www.sec.gov/Archives/edgar/data/1412486/0001493152-26-007430.txt
 COHN,2025-12-22,2026-02-13,2,dilution_bank|pipe_financing,https://www.sec.gov/Archives/edgar/data/1270436/0001104659-26-015296.txt
 CPIX,2025-11-24,2025-11-24,1,dilution_bank,https://www.sec.gov/Archives/edgar/data/1087294/0001087294-25-000023.txt
 CPSS,2025-11-25,2025-11-25,2,dilution_bank,https://www.sec.gov/Archives/edgar/data/889609/0001683168-25-008677.txt
@@ -84,7 +84,7 @@ CRMT,2026-01-16,2026-01-16,4,dilution_bank|pipe_financing,https://www.sec.gov/Ar
 CRVO,2025-12-05,2025-12-05,1,dilution_bank,https://www.sec.gov/Archives/edgar/data/1053691/0001437749-25-037025.txt
 CTEV,2025-11-14,2025-11-14,2,convert_financing|dilution_bank|pipe_financing,https://www.sec.gov/Archives/edgar/data/1793229/0001104659-25-111757.txt
 CTGO,2026-02-12,2026-02-18,3,dilution_bank,https://www.sec.gov/Archives/edgar/data/1502377/0001193125-26-057344.txt
-CTNT,2026-02-03,2026-02-03,3,convert_financing|dilution_bank,https://www.sec.gov/Archives/edgar/data/1951667/0001104659-26-009731.txt
+CTNT,2026-02-03,2026-02-19,4,pipe_financing,https://www.sec.gov/Archives/edgar/data/1951667/0001104659-26-017549.txt
 CTRN,2026-01-12,2026-01-12,1,dilution_bank,https://www.sec.gov/Archives/edgar/data/1318484/0001104659-26-002693.txt
 CURX,2026-01-05,2026-01-05,1,dilution_bank,https://www.sec.gov/Archives/edgar/data/2025942/0001493152-26-000358.txt
 CVCO,2026-01-29,2026-01-29,1,dilution_bank,https://www.sec.gov/Archives/edgar/data/278166/0001628280-26-004168.txt
@@ -116,7 +116,7 @@ EEIQ,2025-11-24,2025-11-24,1,dilution_bank|pipe_financing,https://www.sec.gov/Ar
 EEX,2025-12-16,2025-12-16,1,dilution_bank,https://www.sec.gov/Archives/edgar/data/1579214/0001193125-25-320084.txt
 EFOI,2025-12-02,2025-12-02,1,dilution_bank|pipe_financing,https://www.sec.gov/Archives/edgar/data/924168/0001628280-25-054586.txt
 EKSO,2026-01-22,2026-02-17,3,convert_financing|dilution_bank|pipe_financing,https://www.sec.gov/Archives/edgar/data/1549084/0001437749-26-004205.txt
-ELAB,2026-02-11,2026-02-17,9,convert_financing|dilution_bank|pipe_financing,https://www.sec.gov/Archives/edgar/data/1840563/0001213900-26-017508.txt
+ELAB,2026-02-11,2026-02-19,10,dilution_bank,https://www.sec.gov/Archives/edgar/data/1840563/0001213900-26-018189.txt
 ELMD,2026-02-10,2026-02-10,2,dilution_bank,https://www.sec.gov/Archives/edgar/data/1488917/0001437749-26-003636.txt
 ELWT,2025-12-19,2025-12-19,1,convert_financing|dilution_bank,https://www.sec.gov/Archives/edgar/data/2063863/0001104659-25-123161.txt
 ENVB,2026-02-06,2026-02-06,10,convert_financing|dilution_bank|pipe_financing,https://www.sec.gov/Archives/edgar/data/890821/0001493152-26-005591.txt
@@ -164,7 +164,7 @@ GURE,2025-12-29,2025-12-29,1,dilution_bank,https://www.sec.gov/Archives/edgar/da
 GXAI,2026-02-04,2026-02-04,4,dilution_bank|pipe_financing,https://www.sec.gov/Archives/edgar/data/1895618/0001213900-26-012367.txt
 HAO,2026-01-23,2026-01-23,1,convert_financing|dilution_bank|pipe_financing,https://www.sec.gov/Archives/edgar/data/1954594/0001213900-26-007328.txt
 HBCP,2025-11-21,2025-11-21,1,convert_financing|dilution_bank|pipe_financing,https://www.sec.gov/Archives/edgar/data/1436425/0001628280-25-053512.txt
-HCWB,2026-02-11,2026-02-13,7,dilution_bank,https://www.sec.gov/Archives/edgar/data/1828673/0001193125-26-049953.txt
+HCWB,2026-02-11,2026-02-19,9,convert_financing|dilution_bank|pipe_financing,https://www.sec.gov/Archives/edgar/data/1828673/0001193125-26-059279.txt
 HFBL,2026-01-28,2026-01-28,2,dilution_bank,https://www.sec.gov/Archives/edgar/data/1500375/0000927089-26-000013.txt
 HIND,2025-12-23,2025-12-23,3,convert_financing,https://www.sec.gov/Archives/edgar/data/1427570/0001213900-25-125310.txt
 HKIT,2025-12-22,2025-12-22,2,dilution_bank|pipe_financing,https://www.sec.gov/Archives/edgar/data/1742341/0001213900-25-124508.txt
@@ -187,7 +187,7 @@ IESC,2026-01-30,2026-01-30,2,dilution_bank,https://www.sec.gov/Archives/edgar/da
 IFBD,2025-12-23,2025-12-23,1,convert_financing|dilution_bank,https://www.sec.gov/Archives/edgar/data/1815566/0001731122-25-001721.txt
 IHT,2026-01-23,2026-01-23,1,dilution_bank,https://www.sec.gov/Archives/edgar/data/82473/0001493152-26-003274.txt
 IMCC,2026-02-05,2026-02-05,1,convert_financing|dilution_bank|pipe_financing,https://www.sec.gov/Archives/edgar/data/1792030/0001178913-26-000322.txt
-IMG,2026-01-28,2026-02-18,7,dilution_bank,https://www.sec.gov/Archives/edgar/data/1527613/0001493152-26-007338.txt
+IMG,2026-01-28,2026-02-19,8,dilution_bank,https://www.sec.gov/Archives/edgar/data/1527613/0001493152-26-007466.txt
 IMNN,2026-02-05,2026-02-05,3,dilution_bank,https://www.sec.gov/Archives/edgar/data/749647/0001493152-26-005203.txt
 INAB,2026-01-30,2026-01-30,3,dilution_bank|pipe_financing,https://www.sec.gov/Archives/edgar/data/1740279/0001193125-26-031886.txt
 INBS,2026-01-28,2026-02-12,6,pipe_financing,https://www.sec.gov/Archives/edgar/data/1725430/0001493152-26-006317.txt
@@ -201,6 +201,7 @@ INLX,2026-02-17,2026-02-17,1,dilution_bank,https://www.sec.gov/Archives/edgar/da
 INM,2026-02-12,2026-02-12,1,pipe_financing,https://www.sec.gov/Archives/edgar/data/1728328/0001062993-26-000819.txt
 INTJ,2025-11-28,2025-11-28,1,dilution_bank,https://www.sec.gov/Archives/edgar/data/1916416/0001213900-25-115748.txt
 IPDN,2025-11-28,2025-11-28,1,dilution_bank,https://www.sec.gov/Archives/edgar/data/1546296/0001437749-25-036494.txt
+IPST,2026-02-19,2026-02-19,1,pipe_financing,https://www.sec.gov/Archives/edgar/data/1788230/0001788230-26-000015.txt
 IPW,2026-02-02,2026-02-10,8,convert_financing|dilution_bank,https://www.sec.gov/Archives/edgar/data/1830072/0001683168-26-000884.txt
 IPWR,2025-12-30,2025-12-30,1,convert_financing|dilution_bank|pipe_financing,https://www.sec.gov/Archives/edgar/data/1507957/0001437749-25-038932.txt
 IQST,2026-02-03,2026-02-04,5,convert_financing,https://www.sec.gov/Archives/edgar/data/1527702/0001663577-26-000039.txt
@@ -259,7 +260,7 @@ MEHA,2026-02-09,2026-02-09,4,convert_financing|dilution_bank|pipe_financing,http
 MFI,2026-01-02,2026-01-02,1,convert_financing|dilution_bank|pipe_financing,https://www.sec.gov/Archives/edgar/data/1940941/0001493152-26-000168.txt
 MGRX,2025-12-19,2025-12-19,4,convert_financing|dilution_bank|pipe_financing,https://www.sec.gov/Archives/edgar/data/1938046/0001493152-25-028461.txt
 MITQ,2026-02-13,2026-02-13,1,dilution_bank,https://www.sec.gov/Archives/edgar/data/1770236/0001437749-26-004067.txt
-MKTW,2026-01-22,2026-01-22,2,dilution_bank,https://www.sec.gov/Archives/edgar/data/1805651/0001805651-26-000004.txt
+MKTW,2026-01-22,2026-02-19,3,dilution_bank,https://www.sec.gov/Archives/edgar/data/1805651/0001805651-26-000008.txt
 MKZR,2026-01-21,2026-01-21,5,dilution_bank,https://www.sec.gov/Archives/edgar/data/1550913/0001550913-26-000008.txt
 MLP,2025-12-29,2025-12-29,2,dilution_bank,https://www.sec.gov/Archives/edgar/data/63330/0001437749-25-038852.txt
 MLR,2025-12-02,2025-12-02,1,dilution_bank,https://www.sec.gov/Archives/edgar/data/924822/0001104659-25-117534.txt
@@ -312,6 +313,7 @@ OPXS,2025-12-08,2025-12-08,1,dilution_bank,https://www.sec.gov/Archives/edgar/da
 OTH,2025-11-17,2025-11-17,1,convert_financing|dilution_bank,https://www.sec.gov/Archives/edgar/data/2067767/0001493152-25-023827.txt
 OVBC,2026-01-27,2026-01-27,1,dilution_bank,https://www.sec.gov/Archives/edgar/data/894671/0000894671-26-000007.txt
 PAPL,2026-02-10,2026-02-10,2,dilution_bank,https://www.sec.gov/Archives/edgar/data/1938109/0001493152-26-005987.txt
+PARK,2026-02-19,2026-02-19,1,dilution_bank,https://www.sec.gov/Archives/edgar/data/2069604/0001104659-26-017525.txt
 PDEX,2026-01-29,2026-01-29,2,dilution_bank,https://www.sec.gov/Archives/edgar/data/788920/0001079973-26-000141.txt
 PEBK,2026-01-26,2026-01-26,1,convert_financing,https://www.sec.gov/Archives/edgar/data/1093672/0001654954-26-000585.txt
 PFIS,2026-01-30,2026-01-30,1,dilution_bank,https://www.sec.gov/Archives/edgar/data/1056943/0001104659-26-008637.txt
@@ -384,7 +386,7 @@ SOBR,2026-01-22,2026-01-22,3,convert_financing|dilution_bank|pipe_financing,http
 SONM,2026-02-05,2026-02-05,3,dilution_bank,https://www.sec.gov/Archives/edgar/data/1178697/0001493152-26-005202.txt
 SOPA,2026-02-06,2026-02-13,7,convert_financing|dilution_bank|pipe_financing,https://www.sec.gov/Archives/edgar/data/1817511/0001493152-26-006687.txt
 SOR,2026-01-30,2026-01-30,2,dilution_bank|pipe_financing,https://www.sec.gov/Archives/edgar/data/91847/0001213900-26-009949.txt
-SOWG,2026-01-07,2026-01-07,2,pipe_financing,https://www.sec.gov/Archives/edgar/data/1490161/0001193125-26-004866.txt
+SOWG,2026-01-07,2026-02-19,3,convert_financing|dilution_bank,https://www.sec.gov/Archives/edgar/data/1490161/0001829126-26-001486.txt
 SPAI,2025-11-28,2025-11-28,1,convert_financing|dilution_bank,https://www.sec.gov/Archives/edgar/data/2011208/0001493152-25-025343.txt
 SPRC,2026-02-03,2026-02-17,5,convert_financing|dilution_bank|pipe_financing,https://www.sec.gov/Archives/edgar/data/1611746/0001213900-26-017502.txt
 SRBK,2025-12-18,2025-12-18,2,dilution_bank,https://www.sec.gov/Archives/edgar/data/1951276/0000943374-25-000521.txt
