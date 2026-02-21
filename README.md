@@ -1,6 +1,6 @@
 # Dilution Scanner
 
-## Version 1.0.0
+## Version 1.1.0
 
 Deterministic SEC EDGAR dilution scanner for U.S. small-cap traders.
 
@@ -39,7 +39,9 @@ Rules are strict substring matches — no heuristics.
 For each date in:
 
 ```
+
 START_DATE .. END_DATE
+
 ```
 
 The system:
@@ -66,7 +68,9 @@ Weekend and holiday handling is automatic (non-200 responses are logged and skip
 Only tickers with:
 
 ```
+
 free_float_shares <= 10,000,000
+
 ```
 
 are scanned.
@@ -82,14 +86,18 @@ Configuration:
 Massive API is authenticated via:
 
 ```
+
 Authorization: Bearer <API_KEY>
+
 ```
 
 Environment variables:
 
 ```
+
 MASSIVE_FLOAT_URL_TEMPLATE
 MASSIVE_API_KEY
+
 ```
 
 ---
@@ -99,8 +107,10 @@ MASSIVE_API_KEY
 The system maintains:
 
 ```
+
 dilution_tickers_all_verbose.csv   (source of truth)
 dilution_tickers_all.csv           (derived ticker-only list)
+
 ```
 
 Verbose master tracks per ticker:
@@ -122,6 +132,37 @@ This creates a rolling, self-cleaning dilution universe.
 
 ---
 
+## 🧠 v1.1.0 — Dilution Severity Intelligence (Additive)
+
+v1.1.0 adds **deterministic severity scoring** per ticker, without changing:
+
+* detection rules
+* float gate
+* pruning behavior
+* determinism constraints
+
+### Severity output
+
+A new artifact ranks tickers by severity across two fixed windows:
+
+* **90-day window**
+* **180-day window**
+
+The scoring is computed from **existing matched filing data only** (no additional API calls).
+
+### Deterministic scoring concept (high level)
+
+Each matched filing contributes a deterministic score derived from:
+
+* **Label weights** (fixed)
+* **Bank tier weights** (fixed mapping of literal bank-name terms)
+* **Toxic financing term weights** (fixed mapping of literal terms)
+* A **fixed bank multiplier** on term score (implemented deterministically)
+
+The per-filing scores are summed by ticker within each window and sorted deterministically.
+
+---
+
 ## 📁 Output Artifacts
 
 Generated under `/output`:
@@ -138,6 +179,29 @@ Generated under `/output`:
 | `label_summary.json`               | Aggregate label counts               |
 | `audit_log.json`                   | Full deterministic execution trace   |
 | `run_metadata.json`                | Run-level metadata including version |
+| `dilution_severity_by_ticker.csv`  | Severity ranking by ticker (90d/180d)|
+
+---
+
+## 📈 Severity Output Details (v1.1.0)
+
+### `dilution_severity_by_ticker.csv` schema (stable order)
+
+* `ticker`
+* `severity_score_90d`
+* `severity_score_180d`
+* `match_count_90d`
+* `match_count_180d`
+* `last_seen_date`
+* `last_labels`
+* `top_terms`
+* `top_banks`
+
+### Deterministic sort order
+
+1. `severity_score_90d` (desc)
+2. `severity_score_180d` (desc)
+3. `ticker` (asc)
 
 ---
 
@@ -168,58 +232,66 @@ The scanner runs:
 Example backfill:
 
 ```
+
 START_DATE = 2025-11-14
 END_DATE   = 2026-02-11
+
 ```
 
 Secrets required:
 
 ```
+
 MASSIVE_API_KEY
+
 ```
 
 ---
 
-## 📊 Current Trading Filters (v1.0.0)
+## 📊 Current Trading Filters (v1.1.0)
 
 * Float ≤ 10,000,000 shares
 * Dilution-related filing language
 * Allowed SEC forms only
 * Active within 180 days
 * U.S.-listed tickers only
+* Deterministic severity ranking (90d + 180d)
 
 ---
 
 ## 🔒 Versioning
 
-Current version: **1.0.0**
+Current version: **1.1.0**
 
-To create a new version:
+To create a new version tag:
 
 ```
-git tag -a v1.0.0 -m "Version 1.0.0 – stable release"
-git push origin v1.0.0
+
+git tag -a v1.1.0 -m "Version 1.1.0 – Severity Intelligence"
+git push origin v1.1.0
+
 ```
 
 Each run writes:
 
 ```
-"system_version": "1.0.0"
+
+"system_version": "1.1.0"
+
 ```
 
 into `run_metadata.json`.
 
 ---
 
-## 🧩 Future Roadmap (Not in v1)
+## 🧩 Future Roadmap (Not in v1.1)
 
-* Severity scoring / weighting
-* Dilution bank tiering
+* “Avoid watchlist” deterministic flags + thresholds (derived from severity components)
 * Lightspeed export formatting
-* Float API caching
 * Rule versioning system
 * Performance guardrails
 * Optional rolling-window mode
+* Additional deterministic summary outputs (e.g., top tickers by day/week)
 
 ---
 
@@ -230,9 +302,9 @@ It does not provide investment advice.
 
 ---
 
-## 🏁 v1 Status
+## 🏁 Status
 
-v1.0.0 represents a stable, production-ready deterministic dilution scanner with:
+v1.1.0 represents a stable, production-ready deterministic dilution scanner with:
 
 * Multi-day scanning
 * 10M float filter
@@ -240,4 +312,5 @@ v1.0.0 represents a stable, production-ready deterministic dilution scanner with
 * 180-day pruning
 * Full audit traceability
 * Automated daily execution
-
+* Deterministic severity ranking output (90d/180d)
+```
