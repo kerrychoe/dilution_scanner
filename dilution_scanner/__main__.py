@@ -8,7 +8,7 @@ from dilution_scanner.master_idx_parser import parse_master_idx
 from dilution_scanner.filings import FilingRef, fetch_primary_filing_text, filing_artifact_basename
 from dilution_scanner.rules import scan_filing_text_for_labels
 
-SYSTEM_VERSION = "1.0.0"
+SYSTEM_VERSION = "1.1.0"
 
 OUTPUT_DIR = "output"
 
@@ -26,7 +26,7 @@ STALE_DAYS = 180
 ALLOWED_FORMS = ["424B", "S-3", "S-1", "F-3", "8-K"]
 
 # SEC requires a descriptive User-Agent with real contact email
-SEC_USER_AGENT = "DilutionTickerScanner/1.0 (contact: kerrychoe@gmail.com)"
+SEC_USER_AGENT = "DilutionTickerScanner/1.1 (contact: kerrychoe@gmail.com)"
 SEC_CONTACT_EMAIL = "kerrychoe@gmail.com"
 
 # LOCKED verbose CSV columns (deterministic order)
@@ -450,7 +450,7 @@ def massive_get_float_records(ticker: str) -> tuple[bool, dict | None, str | Non
         "Accept-Encoding": "identity",
         "Connection": "close",
         "Authorization": f"Bearer {api_key}",  # Massive supports this, per your docs
-        "User-Agent": "DilutionTickerScanner/1.0",
+        "User-Agent": "DilutionTickerScanner/1.1",
     }
 
     last_exc = None
@@ -565,6 +565,260 @@ def csv_lines_for_float_gate(rows: list[dict]) -> str:
         )
     return "".join(out)
 
+
+# -----------------------------
+# v1.1.0 — DILUTION SEVERITY INTELLIGENCE (ADDITIVE)
+# -----------------------------
+
+LABEL_WEIGHT = {
+    "dilution_bank": 5,
+    "pipe_financing": 3,
+    "convert_financing": 3,
+}
+
+BANK_WEIGHT = {
+    "aegis capital": 5,
+    "maxim group": 5,
+    "maxim": 5,
+
+    "a.g.p.": 4,
+    "agp": 4,
+    "alliance global partners": 4,
+    "h.c. wainwright": 4,
+    "hc wainwright": 4,
+    "roth capital": 4,
+    "roth mkms": 4,
+
+    "westpark capital": 3,
+    "thinkequity": 3,
+
+    "boustead securities": 2,
+    "benjamin securities": 2,
+
+    "ef hutton": 1,
+}
+
+TERM_WEIGHT = {
+    # Convert (highest)
+    "convertible note": 5,
+    "convertible notes": 5,
+    "convertible debenture": 5,
+    "convertible debentures": 5,
+    "senior convertible": 4,
+    "conversion price": 4,
+    "conversion feature": 4,
+    "convertible preferred": 4,
+    "variable rate": 5,
+    "reset price": 5,
+    "price reset": 5,
+
+    # PIPE / structures (medium)
+    "pipe financing": 3,
+    "private investment in public equity": 3,
+    "private investment in public equities": 3,
+    "private placement": 3,
+    "registered direct": 3,
+
+    # Facilities (lower)
+    "equity line of credit": 2,
+    "at-the-market": 2,
+    "at the market": 2,
+    "atm offering": 2,
+    "eloc": 2,
+}
+
+# Use integer multipliers (basis points) to avoid float nondeterminism
+BANK_MULTIPLIER_BPS = {
+    0: 100,
+    1: 105,
+    2: 110,
+    3: 120,
+    4: 135,
+    5: 150,
+}
+
+def _severity_label_score(labels: list[str]) -> int:
+    # unique labels only, deterministic
+    uniq = sorted(set([str(x) for x in (labels or []) if str(x)]))
+    s = 0
+    for lab in uniq:
+        s += LABEL_WEIGHT.get(lab, 0)
+    return s
+
+def _severity_bank_score(matched_terms: list[str]) -> int:
+    # max bank tier weight
+    best = 0
+    for t in (matched_terms or []):
+        w = BANK_WEIGHT.get(t, 0)
+        if w > best:
+            best = w
+    return best
+
+def _severity_term_score(matched_terms: list[str]) -> int:
+    # sum toxic term weights
+    s = 0
+    for t in (matched_terms or []):
+        s += TERM_WEIGHT.get(t, 0)
+    return s
+
+def _severity_final_filing_score(labels: list[str], matched_terms: list[str]) -> int:
+    label_score = _severity_label_score(labels)
+    bank_score = _severity_bank_score(matched_terms)
+    term_score = _severity_term_score(matched_terms)
+
+    mult = BANK_MULTIPLIER_BPS.get(bank_score, 100)
+    term_component = (term_score * mult) // 100
+
+    # Option C + Backstop (ranking score is the combined score)
+    return label_score + term_component + bank_score
+
+def _write_severity_csv(path: str, rows: list[dict]):
+    cols = [
+        "ticker",
+        "severity_score_90d",
+        "severity_score_180d",
+        "match_count_90d",
+        "match_count_180d",
+        "last_seen_date",
+        "last_labels",
+        "top_terms",
+        "top_banks",
+    ]
+    lines = [",".join(cols) + "\n"]
+    for r in rows:
+        lines.append(
+            ",".join([csv_escape(r.get(c, "")) for c in cols]) + "\n"
+        )
+    write_file_text(path, "".join(lines))
+
+def build_dilution_severity_by_ticker(matched_allowed_all: list[dict], end_date_iso: str):
+    """
+    Additive v1.1.0 artifact.
+    Uses only in-memory matched_allowed_all + end_date.
+    No new API calls.
+    Deterministic ordering and integer scoring.
+    """
+    try:
+        end_obj = date.fromisoformat(end_date_iso)
+    except Exception:
+        return
+
+    start_90 = end_obj - timedelta(days=89)
+    start_180 = end_obj - timedelta(days=179)
+
+    # ticker -> list of filings (within 180d window for top_terms/top_banks + last_seen)
+    by_ticker = {}
+
+    # We score filings even if fetch failed; but v1.0.0 only treats "matched" as labels present.
+    # So we include only rows that have labels AND ticker present.
+    for r in (matched_allowed_all or []):
+        tkr = str(r.get("ticker") or "").strip().upper()
+        labels = r.get("labels") or []
+        if not tkr:
+            continue
+        if not labels:
+            continue
+
+        dstr = str(r.get("date") or "").strip()
+        try:
+            dobj = date.fromisoformat(dstr)
+        except Exception:
+            continue
+
+        matched_terms = r.get("matched_terms") or []
+        filename = str(r.get("filename") or "").strip()
+
+        filing_score = _severity_final_filing_score(labels=labels, matched_terms=matched_terms)
+
+        item = {
+            "date": dobj,
+            "date_iso": dobj.isoformat(),
+            "filename": filename,
+            "labels": [str(x) for x in labels],
+            "matched_terms": [str(x) for x in matched_terms],
+            "filing_score": filing_score,
+        }
+
+        by_ticker.setdefault(tkr, []).append(item)
+
+    out_rows = []
+
+    for tkr in sorted(by_ticker.keys()):
+        items = by_ticker[tkr]
+
+        # 90d / 180d aggregates
+        sev_90 = 0
+        sev_180 = 0
+        cnt_90 = 0
+        cnt_180 = 0
+
+        term_freq = {}
+        bank_freq = {}
+
+        # last seen (deterministic tie-break: (date, filename) max)
+        last_key = None
+        last_seen_date = ""
+        last_labels = []
+
+        for it in items:
+            d = it["date"]
+            score = int(it["filing_score"])
+
+            if d >= start_180 and d <= end_obj:
+                sev_180 += score
+                cnt_180 += 1
+
+                # top_terms/top_banks based on 180d window only
+                for term in it["matched_terms"]:
+                    if term in TERM_WEIGHT:
+                        term_freq[term] = term_freq.get(term, 0) + 1
+                    if term in BANK_WEIGHT:
+                        bank_freq[term] = bank_freq.get(term, 0) + 1
+
+                key = (it["date_iso"], it["filename"])
+                if (last_key is None) or (key > last_key):
+                    last_key = key
+                    last_seen_date = it["date_iso"]
+                    last_labels = it["labels"]
+
+            if d >= start_90 and d <= end_obj:
+                sev_90 += score
+                cnt_90 += 1
+
+        # top_terms/top_banks (freq desc, term asc), take top 3
+        top_terms_list = sorted(term_freq.items(), key=lambda kv: (-kv[1], kv[0]))[:3]
+        top_banks_list = sorted(bank_freq.items(), key=lambda kv: (-kv[1], kv[0]))[:3]
+
+        top_terms = "|".join([k for k, _v in top_terms_list])
+        top_banks = "|".join([k for k, _v in top_banks_list])
+
+        out_rows.append(
+            {
+                "ticker": tkr,
+                "severity_score_90d": str(sev_90),
+                "severity_score_180d": str(sev_180),
+                "match_count_90d": str(cnt_90),
+                "match_count_180d": str(cnt_180),
+                "last_seen_date": last_seen_date,
+                "last_labels": "|".join(sorted(set(last_labels))) if last_labels else "",
+                "top_terms": top_terms,
+                "top_banks": top_banks,
+            }
+        )
+
+    # sort: severity_score_90d desc, severity_score_180d desc, ticker asc
+    def _to_int(s):
+        try:
+            return int(str(s))
+        except Exception:
+            return 0
+
+    out_rows.sort(
+        key=lambda r: (-_to_int(r["severity_score_90d"]), -_to_int(r["severity_score_180d"]), r["ticker"])
+    )
+
+    _write_severity_csv(f"{OUTPUT_DIR}/dilution_severity_by_ticker.csv", out_rows)
+    
 
 def main():
     ensure_output_dir()
@@ -997,6 +1251,7 @@ def main():
     # -----------------------------
     write_file_text(f"{OUTPUT_DIR}/allowed_filings.json", json.dumps(allowed_filings_all, indent=2))
     write_file_text(f"{OUTPUT_DIR}/matched_allowed_filings.json", json.dumps(matched_allowed_all, indent=2))
+    build_dilution_severity_by_ticker(matched_allowed_all=matched_allowed_all, end_date_iso=end_date)
 
     verbose_header = ",".join(VERBOSE_COLUMNS) + "\n"
     write_file_text(f"{OUTPUT_DIR}/dilution_tickers_verbose.csv", verbose_header + "".join(verbose_rows_all))
@@ -1251,7 +1506,25 @@ def main():
     write_file_text(f"{OUTPUT_DIR}/sample_filing_fetch.json", json.dumps(sample_results, indent=2))
 
     run_meta = {
-        "system_version": SYSTEM_VERSION,        
+        "system_version": SYSTEM_VERSION,
+        "output_artifacts": [
+            "allowed_filings.json",
+            "matched_allowed_filings.json",
+            "dilution_tickers_verbose.csv",
+            "dilution_tickers.csv",
+            "dilution_tickers_all_verbose.csv",
+            "dilution_tickers_all.csv",
+            "float_cache.json",
+            "float_gate_pass.csv",
+            "float_gate_fail.csv",
+            "float_gate_unknown.csv",
+            "label_summary.json",
+            "label_summary.csv",
+            "audit_log.json",
+            "run_metadata.json",
+            "sample_filing_fetch.json",
+            "dilution_severity_by_ticker.csv",
+        ],
         "run_timestamp_utc": run_time,
         "scan_start_date": start_date,
         "scan_end_date": end_date,
