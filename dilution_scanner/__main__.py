@@ -9,53 +9,43 @@ from dilution_scanner.master_idx_parser import parse_master_idx
 from dilution_scanner.filings import FilingRef, fetch_primary_filing_text, filing_artifact_basename
 from dilution_scanner.rules import scan_filing_text_for_labels
 
-SYSTEM_VERSION = "1.1.1"
+SYSTEM_VERSION = "1.1.2"
 
 OUTPUT_DIR = "output"
 
-# Deterministic cap for filings we parse/scan
-MAX_SAMPLE_BYTES = 2_000_000  # 2 MB
+# Default scan range behavior:
+# - In daily cron mode (no start/end provided): scan "yesterday" only
+# - In workflow_dispatch mode: scan user-provided start/end (inclusive)
+DEFAULT_DAILY_LOOKBACK_DAYS = 1
 
-# FLOAT GATE (LOCKED)
-FLOAT_MAX_SHARES = 10_000_000
-FLOAT_GATE_POLICY = "strict_tradeable_only"  # locked
-
-# STALE PRUNE (LOCKED)
-STALE_DAYS = 180
-
-# LOCKED form allowlist (deterministic)
+# EDGAR index parsing constraints
 ALLOWED_FORMS = ["424B", "S-3", "S-1", "F-3", "8-K"]
 
 # SEC requires a descriptive User-Agent with real contact email
-SEC_USER_AGENT = "DilutionTickerScanner/1.1.1 (contact: kerrychoe@gmail.com)"
+SEC_USER_AGENT = "DilutionTickerScanner/1.1.2 (contact: kerrychoe@gmail.com)"
 SEC_CONTACT_EMAIL = "kerrychoe@gmail.com"
 
-# LOCKED verbose CSV columns (deterministic order)
+# Output schema (locked)
 VERBOSE_COLUMNS = [
     "date",
-    "ticker",
     "cik",
-    "company",
+    "ticker",
+    "company_name",
     "form_type",
-    "accession",
-    "filing_url",
-    "free_float_shares",
+    "filename",
+    "index_url",
     "labels",
     "matched_terms",
 ]
 
-# Float Gate artifacts
-FLOAT_CACHE_PATH = f"{OUTPUT_DIR}/float_cache.json"
-FLOAT_PASS_CSV = f"{OUTPUT_DIR}/float_gate_pass.csv"
-FLOAT_FAIL_CSV = f"{OUTPUT_DIR}/float_gate_fail.csv"
-FLOAT_UNKNOWN_CSV = f"{OUTPUT_DIR}/float_gate_unknown.csv"
+SUMMARY_COLUMNS = [
+    "date",
+    "ticker",
+    "labels",
+    "index_url",
+]
 
-# Persistent aggregate artifacts (repo root persisted; output written each run)
-ALL_TICKERS_ROOT = "dilution_tickers_all.csv"
-ALL_VERBOSE_ROOT = "dilution_tickers_all_verbose.csv"
-ALL_TICKERS_OUT = f"{OUTPUT_DIR}/dilution_tickers_all.csv"
-ALL_VERBOSE_OUT = f"{OUTPUT_DIR}/dilution_tickers_all_verbose.csv"
-
+# Persistent master schema (locked)
 ALL_VERBOSE_COLUMNS = [
     "ticker",
     "first_seen_date",
@@ -65,567 +55,568 @@ ALL_VERBOSE_COLUMNS = [
     "last_filing_url",
 ]
 
+ALL_SUMMARY_COLUMNS = [
+    "ticker",
+    "first_seen_date",
+    "last_seen_date",
+    "seen_count",
+]
+
+# Master prune (locked)
+MASTER_PRUNE_DAYS = 180
+
+# Massive float gate (locked)
+MASSIVE_API_URL = "https://api.massive.com/stocks/v1/getStockFloatVX"
+MASSIVE_API_KEY_ENV = "MASSIVE_API_KEY"
+FLOAT_MAX = 10_000_000
+FLOAT_RETRIES = 3
+FLOAT_RETRY_SLEEP_SECONDS = 1.0
+
+FLOAT_CACHE_PATH = f"{OUTPUT_DIR}/float_cache.json"
+
+FLOAT_GATE_PASS_CSV = f"{OUTPUT_DIR}/float_gate_pass.csv"
+FLOAT_GATE_FAIL_CSV = f"{OUTPUT_DIR}/float_gate_fail.csv"
+FLOAT_GATE_UNKNOWN_CSV = f"{OUTPUT_DIR}/float_gate_unknown.csv"
+
+# v1.1.x additive severity output
+SEVERITY_BY_TICKER_CSV = f"{OUTPUT_DIR}/dilution_severity_by_ticker.csv"
+
 # v1.1.1 additive derived output
 AVOID_TICKERS_CSV = f"{OUTPUT_DIR}/avoid_tickers.csv"
+
+# v1.1.2 additive: persistent severity events master (repo root persisted; output written each run)
+SEVERITY_EVENTS_ROOT = "dilution_severity_events_all.csv"
+SEVERITY_EVENTS_OUT = f"{OUTPUT_DIR}/dilution_severity_events_all.csv"
 
 
 def ensure_output_dir():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
-def write_file_bytes(path, content_bytes: bytes):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "wb") as f:
-        f.write(content_bytes)
+def write_file_text(path: str, content: str):
+    ensure_output_dir()
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write(content)
 
 
-def write_file_text(path, content_text: str):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(content_text)
-
-
-def read_json_file(path: str):
+def read_file_text(path: str) -> str:
     with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+        return f.read()
 
 
-def parse_dates():
-    start_env = os.getenv("START_DATE", "").strip()
-    end_env = os.getenv("END_DATE", "").strip()
-
-    if start_env and end_env:
-        start_date = start_env
-        end_date = end_env
-        mode = "explicit"
-    else:
-        yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).date().isoformat()
-        start_date = yesterday
-        end_date = yesterday
-        mode = "default_yesterday"
-
-    return start_date, end_date, mode
+def csv_escape(value: str) -> str:
+    if value is None:
+        return ""
+    s = str(value)
+    # Ensure deterministic CSV quoting behavior using csv module rules via manual escape
+    if any(ch in s for ch in [",", '"', "\n", "\r"]):
+        s = s.replace('"', '""')
+        return f'"{s}"'
+    return s
 
 
-def iter_date_range_inclusive(start_iso: str, end_iso: str) -> list[str]:
-    s = date.fromisoformat(start_iso)
-    e = date.fromisoformat(end_iso)
-    if e < s:
-        s, e = e, s
+def _safe_int(x, default=0) -> int:
+    try:
+        if x is None:
+            return int(default)
+        s = str(x).strip()
+        if s == "":
+            return int(default)
+        return int(float(s))
+    except Exception:
+        return int(default)
 
+
+def _date_to_obj(date_str: str):
+    try:
+        return date.fromisoformat(date_str)
+    except Exception:
+        return None
+
+
+def _iso_today_utc() -> str:
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+def _iso_yesterday_utc() -> str:
+    return (datetime.now(timezone.utc).date() - timedelta(days=1)).isoformat()
+
+
+def _date_range_inclusive(start_iso: str, end_iso: str) -> list[str]:
+    start = date.fromisoformat(start_iso)
+    end = date.fromisoformat(end_iso)
     out = []
-    cur = s
-    while cur <= e:
+    cur = start
+    while cur <= end:
         out.append(cur.isoformat())
         cur = cur + timedelta(days=1)
     return out
 
 
-def sec_get(url: str, timeout_sec: int = 30) -> requests.Response:
-    headers = {
-        "User-Agent": SEC_USER_AGENT,
-        "From": SEC_CONTACT_EMAIL,
-        "Accept": "text/plain,application/json,application/octet-stream,*/*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "identity",
-        "Connection": "close",
-        "Referer": "https://www.sec.gov/",
-    }
-
-    last_exc = None
-    for attempt in range(1, 4):
-        try:
-            resp = requests.get(url, headers=headers, timeout=timeout_sec)
-            return resp
-        except Exception as e:
-            last_exc = e
-            time.sleep(attempt)
-
-    raise RuntimeError(f"SEC GET failed after 3 attempts: {url}") from last_exc
+def _json_dump_stable(obj) -> str:
+    return json.dumps(obj, indent=2, sort_keys=True)
 
 
-def master_idx_url_for_date(date_iso: str) -> str:
-    year, month, day = date_iso.split("-")
-    y = int(year)
-    m = int(month)
-    qtr = (m - 1) // 3 + 1
-    yyyymmdd = f"{year}{month}{day}"
-    return f"https://www.sec.gov/Archives/edgar/daily-index/{y}/QTR{qtr}/master.{yyyymmdd}.idx"
-
-
-def accession_from_filename(filename: str) -> str:
-    base = os.path.basename(filename)
-    if base.lower().endswith(".txt"):
-        return base[:-4]
-    return base
-
-
-def normalize_cik(cik_str: str) -> str:
-    try:
-        return str(int(str(cik_str).strip()))
-    except Exception:
-        return str(cik_str).strip()
-
-
-def csv_escape(value) -> str:
-    if value is None:
-        s = ""
-    else:
-        s = str(value)
-
-    needs_quote = ("," in s) or ('"' in s) or ("\n" in s) or ("\r" in s)
-    if '"' in s:
-        s = s.replace('"', '""')
-    if needs_quote:
-        return f'"{s}"'
-    return s
-
-
-# -----------------------------
-# AUDIT LOG HELPERS
-# -----------------------------
-def new_audit(run_time_utc: str, start_date: str, end_date: str, date_mode: str) -> dict:
-    return {
-        "run_timestamp_utc": run_time_utc,
-        "start_date": start_date,
-        "end_date": end_date,
-        "date_mode": date_mode,
-        "events": [],
-        "counts": {},
-        "by_date": [],
-        "error_samples": [],
-        "float_gate": {},
-        "stale_prune": {},
-    }
-
-
-def audit_event(audit: dict, event: str, data: dict | None = None):
-    audit["events"].append({"event": event, "data": (data or {})})
-
-
-# -----------------------------
-# CIK -> TICKER MAP
-# -----------------------------
-def _parse_company_tickers_json(raw_bytes: bytes) -> dict:
-    data = json.loads(raw_bytes.decode("utf-8", errors="replace"))
-    if isinstance(data, dict):
-        items = data.values()
-    elif isinstance(data, list):
-        items = data
-    else:
-        items = []
-
-    out = {}
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        cik_val = item.get("cik_str")
-        ticker = item.get("ticker")
-        if cik_val is None or ticker is None:
-            continue
-        cik_key = normalize_cik(cik_val)
-        ticker_val = str(ticker).strip().upper()
-        if cik_key and ticker_val:
-            out[cik_key] = ticker_val
-    return out
-
-
-def _parse_company_tickers_exchange_json(raw_bytes: bytes) -> dict:
-    data = json.loads(raw_bytes.decode("utf-8", errors="replace"))
-    if isinstance(data, dict):
-        items = list(data.values())
-    elif isinstance(data, list):
-        items = data
-    else:
-        items = []
-
-    out = {}
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        cik_val = item.get("cik") or item.get("cik_str")
-        ticker = item.get("ticker")
-        if cik_val is None or ticker is None:
-            continue
-        cik_key = normalize_cik(cik_val)
-        ticker_val = str(ticker).strip().upper()
-        if cik_key and ticker_val:
-            out[cik_key] = ticker_val
-    return out
-
-
-def load_cik_to_ticker_map_dual_source() -> tuple:
-    primary_url = "https://www.sec.gov/files/company_tickers.json"
-    exchange_url = "https://www.sec.gov/files/company_tickers_exchange.json"
-
-    resp1 = sec_get(primary_url)
-    if resp1.status_code != 200 or not resp1.content:
-        raise RuntimeError(f"Failed to fetch company_tickers.json (status={resp1.status_code})")
-    write_file_bytes(f"{OUTPUT_DIR}/sec_company_tickers.json", resp1.content)
-    primary_map = _parse_company_tickers_json(resp1.content)
-
-    resp2 = sec_get(exchange_url)
-    if resp2.status_code != 200 or not resp2.content:
-        raise RuntimeError(f"Failed to fetch company_tickers_exchange.json (status={resp2.status_code})")
-    write_file_bytes(f"{OUTPUT_DIR}/sec_company_tickers_exchange.json", resp2.content)
-    exchange_map = _parse_company_tickers_exchange_json(resp2.content)
-
-    combined = dict(primary_map)
-    filled_from_exchange = 0
-    for cik_key in sorted(exchange_map.keys()):
-        if cik_key not in combined:
-            combined[cik_key] = exchange_map[cik_key]
-            filled_from_exchange += 1
-
-    meta = {
-        "primary_url": primary_url,
-        "exchange_url": exchange_url,
-        "primary_count": len(primary_map),
-        "exchange_count": len(exchange_map),
-        "combined_count": len(combined),
-        "filled_from_exchange": filled_from_exchange,
-        "primary_saved_path": "output/sec_company_tickers.json",
-        "exchange_saved_path": "output/sec_company_tickers_exchange.json",
-    }
-    return combined, meta
-
-
-# -----------------------------
-# TICKER LIST HELPERS
-# -----------------------------
-def read_ticker_list(path: str) -> list:
+def _read_csv_dicts(path: str) -> list[dict]:
     if not os.path.exists(path):
         return []
-    out = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            t = line.strip().upper()
-            if t:
-                out.append(t)
-    return out
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        return list(reader)
 
 
-def write_ticker_list(path: str, tickers: list):
-    uniq = sorted(set([t.strip().upper() for t in tickers if t and t.strip()]))
-    write_file_text(path, "\n".join(uniq) + ("\n" if uniq else ""))
+def _write_csv_dicts(path: str, columns: list[str], rows: list[dict]):
+    lines = [",".join(columns) + "\n"]
+    for r in rows:
+        vals = []
+        for c in columns:
+            vals.append(csv_escape(r.get(c, "")))
+        lines.append(",".join(vals) + "\n")
+    write_file_text(path, "".join(lines))
 
 
-# -----------------------------
-# PERSISTENT ALL-VERBOSE (SOURCE OF TRUTH)
-# -----------------------------
-def _parse_all_verbose_csv(path: str) -> dict:
+def _load_float_cache() -> dict:
+    if not os.path.exists(FLOAT_CACHE_PATH):
+        return {}
+    try:
+        return json.loads(read_file_text(FLOAT_CACHE_PATH))
+    except Exception:
+        return {}
+
+
+def _save_float_cache(cache: dict):
+    write_file_text(FLOAT_CACHE_PATH, _json_dump_stable(cache))
+
+
+def _massive_get_float_for_ticker(ticker: str) -> dict:
     """
-    Returns dict[ticker] = record dict (columns in ALL_VERBOSE_COLUMNS)
-    Deterministic: ignores unknown columns; last duplicate row wins (stable due to file order).
+    Calls Massive API getStockFloatVX for a single ticker.
+    Deterministic:
+      - no concurrency
+      - fixed retries
+      - stable request payload
+    """
+    api_key = os.environ.get(MASSIVE_API_KEY_ENV, "").strip()
+    if not api_key:
+        return {"ok": False, "error": "MASSIVE_API_KEY missing", "float": None, "raw": None}
+
+    headers = {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "x-api-key": api_key,
+    }
+    payload = {"tickers": [ticker]}
+
+    last_err = None
+    for attempt in range(FLOAT_RETRIES):
+        try:
+            resp = requests.post(MASSIVE_API_URL, headers=headers, json=payload, timeout=30)
+            if resp.status_code != 200:
+                last_err = f"status={resp.status_code}"
+                time.sleep(FLOAT_RETRY_SLEEP_SECONDS)
+                continue
+            data = resp.json()
+            # The API returns a list of results per ticker. We take the most recent effective date.
+            # Deterministic sorting happens in downstream parsing.
+            return {"ok": True, "error": None, "float": None, "raw": data}
+        except Exception as e:
+            last_err = str(e)
+            time.sleep(FLOAT_RETRY_SLEEP_SECONDS)
+
+    return {"ok": False, "error": last_err or "unknown_error", "float": None, "raw": None}
+
+
+def _extract_best_float_from_massive_raw(raw: dict) -> dict:
+    """
+    Deterministically selects the best float record for the requested ticker from Massive response:
+      - choose the highest effectiveDate (string compare after parsing)
+      - return freeFloatShares if present else None
+    """
+    if not isinstance(raw, dict):
+        return {"float": None, "effective_date": None, "percent": None}
+
+    results = raw.get("results")
+    if not isinstance(results, list) or len(results) == 0:
+        return {"float": None, "effective_date": None, "percent": None}
+
+    # Each entry in results corresponds to a ticker. Expect fields like:
+    # { "ticker": "XYZ", "stockFloat": [ { "effectiveDate": "...", "freeFloatShares": ..., "freeFloatPercent": ... }, ... ] }
+    entry = results[0]
+    stock_float = entry.get("stockFloat")
+    if not isinstance(stock_float, list) or len(stock_float) == 0:
+        return {"float": None, "effective_date": None, "percent": None}
+
+    # Deterministic: sort by effectiveDate desc, then freeFloatShares desc
+    def key_fn(x):
+        d = str(x.get("effectiveDate") or "")
+        # Keep string; assume ISO-like
+        f = _safe_int(x.get("freeFloatShares"), default=0)
+        return (d, f)
+
+    best = sorted(stock_float, key=key_fn, reverse=True)[0]
+    return {
+        "float": _safe_int(best.get("freeFloatShares"), default=0) or None,
+        "effective_date": str(best.get("effectiveDate") or "") or None,
+        "percent": best.get("freeFloatPercent"),
+    }
+
+
+def _float_gate_for_tickers(tickers: list[str], audit: dict) -> tuple[list[str], list[dict], list[dict], list[dict]]:
+    """
+    Returns:
+      - pass_tickers list (float <= 10M)
+      - pass_rows
+      - fail_rows
+      - unknown_rows
+    Deterministic ordering.
+    """
+    cache = _load_float_cache()
+    pass_tickers = []
+    pass_rows = []
+    fail_rows = []
+    unknown_rows = []
+
+    tickers_norm = sorted({(t or "").strip().upper() for t in tickers if (t or "").strip()})
+
+    for t in tickers_norm:
+        if t in cache:
+            rec = cache[t]
+        else:
+            api_resp = _massive_get_float_for_ticker(t)
+            if not api_resp.get("ok"):
+                rec = {"float": None, "effective_date": None, "raw": None, "error": api_resp.get("error")}
+            else:
+                best = _extract_best_float_from_massive_raw(api_resp.get("raw"))
+                rec = {
+                    "float": best.get("float"),
+                    "effective_date": best.get("effective_date"),
+                    "raw": api_resp.get("raw"),
+                    "error": None,
+                }
+            cache[t] = rec
+
+        f = rec.get("float")
+        eff = rec.get("effective_date") or ""
+
+        if f is None:
+            unknown_rows.append({"ticker": t, "float": "", "effective_date": eff, "reason": "float_unknown"})
+            continue
+
+        if int(f) <= int(FLOAT_MAX):
+            pass_tickers.append(t)
+            pass_rows.append({"ticker": t, "float": str(int(f)), "effective_date": eff, "reason": "pass"})
+        else:
+            fail_rows.append({"ticker": t, "float": str(int(f)), "effective_date": eff, "reason": "float_gt_10m"})
+
+    _save_float_cache(cache)
+
+    audit["float_gate"] = {
+        "tickers_considered": len(tickers_norm),
+        "pass_count": len(pass_tickers),
+        "fail_count": len(fail_rows),
+        "unknown_count": len(unknown_rows),
+    }
+
+    return pass_tickers, pass_rows, fail_rows, unknown_rows
+
+
+def csv_lines_for_float_gate(rows: list[dict]) -> str:
+    cols = ["ticker", "float", "effective_date", "reason"]
+    out = [",".join(cols) + "\n"]
+    for r in rows:
+        out.append(",".join([csv_escape(r.get(c, "")) for c in cols]) + "\n")
+    return "".join(out)
+
+
+#
+# -----------------------------
+# v1.1.2 — PERSISTENT SEVERITY EVENTS MASTER (OPTION B)
+# -----------------------------
+SEVERITY_EVENTS_COLUMNS = [
+    "event_key",
+    "date",
+    "ticker",
+    "cik",
+    "form_type",
+    "filename",
+    "filing_url",
+    "labels",
+    "matched_terms",
+    "bank_score",
+    "term_score",
+    "final_filing_score",
+]
+
+
+def _severity_event_key(ticker: str, date_iso: str, filename: str) -> str:
+    t = (ticker or "").strip().upper()
+    d = (date_iso or "").strip()
+    f = (filename or "").strip()
+    return f"{t}|{d}|{f}"
+
+
+def _parse_severity_events_csv(path: str) -> dict:
+    """
+    Returns dict[event_key] = row dict (only SEVERITY_EVENTS_COLUMNS)
+    Deterministic: ignores unknown columns; last duplicate event_key wins (stable due to file order).
     """
     if not os.path.exists(path):
         return {}
 
-    with open(path, "r", encoding="utf-8") as f:
-        lines = f.read().splitlines()
-
-    if not lines:
-        return {}
-
-    header = lines[0].split(",")
-    idx = {name: i for i, name in enumerate(header)}
-
     out = {}
-    for line in lines[1:]:
-        if not line.strip():
-            continue
-        # Minimal CSV parsing (values in our file contain no commas except possibly labels/url;
-        # we avoid commas by using | in labels and plain URL. Still, for safety, handle quoted commas naively.)
-        parts = []
-        cur = ""
-        in_q = False
-        i = 0
-        while i < len(line):
-            ch = line[i]
-            if ch == '"' and (i == 0 or line[i - 1] != "\\"):
-                # CSV quotes: toggle unless doubled quote
-                if in_q and i + 1 < len(line) and line[i + 1] == '"':
-                    cur += '"'
-                    i += 2
-                    continue
-                in_q = not in_q
-                i += 1
+    with open(path, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames:
+            return {}
+        for row in reader:
+            ek = (row.get("event_key") or "").strip()
+            if not ek:
+                # deterministic: skip malformed rows
                 continue
-            if ch == "," and not in_q:
-                parts.append(cur)
-                cur = ""
-                i += 1
-                continue
-            cur += ch
-            i += 1
-        parts.append(cur)
-
-        ticker = ""
-        if "ticker" in idx and idx["ticker"] < len(parts):
-            ticker = parts[idx["ticker"]].strip().upper()
-        if not ticker:
-            continue
-
-        rec = {}
-        for col in ALL_VERBOSE_COLUMNS:
-            v = ""
-            if col in idx and idx[col] < len(parts):
-                v = parts[idx[col]].strip()
-            rec[col] = v
-        out[ticker] = rec
-
+            rec = {}
+            for col in SEVERITY_EVENTS_COLUMNS:
+                rec[col] = (row.get(col) or "").strip()
+            out[ek] = rec
     return out
 
 
-def _write_all_verbose_csv(path: str, records: dict):
+def _write_severity_events_csv(path: str, records_by_key: dict):
     """
-    records: dict[ticker] -> rec
-    Deterministic ordering: ticker ascending
+    Deterministic ordering: event_key asc
     """
-    lines = [",".join(ALL_VERBOSE_COLUMNS) + "\n"]
-    for tkr in sorted(records.keys()):
-        rec = records[tkr]
+    lines = [",".join(SEVERITY_EVENTS_COLUMNS) + "\n"]
+    for ek in sorted(records_by_key.keys()):
+        rec = records_by_key[ek]
         row = []
-        for col in ALL_VERBOSE_COLUMNS:
+        for col in SEVERITY_EVENTS_COLUMNS:
             row.append(csv_escape(rec.get(col, "")))
         lines.append(",".join(row) + "\n")
     write_file_text(path, "".join(lines))
 
 
-def _iso_today_from_end_date(end_date_iso: str) -> str:
-    return end_date_iso
+def update_severity_events_master(matched_allowed_all: list[dict], end_date_iso: str, audit: dict | None = None) -> list[dict]:
+    """
+    v1.1.2 Option B:
+      - Load existing severity events master (repo root preferred)
+      - Append new matched events from this run (labels present AND ticker present)
+      - Dedupe by event_key
+      - Prune events older than END_DATE-179 days (180d window inclusive)
+      - Write output/dilution_severity_events_all.csv
+      - Return pruned events list (as dicts)
+    """
+    prior = {}
+    prior_source = "none"
+    if os.path.exists(SEVERITY_EVENTS_ROOT):
+        prior = _parse_severity_events_csv(SEVERITY_EVENTS_ROOT)
+        prior_source = "repo_root"
+    elif os.path.exists(SEVERITY_EVENTS_OUT):
+        prior = _parse_severity_events_csv(SEVERITY_EVENTS_OUT)
+        prior_source = "output"
 
+    prior_count = len(prior)
 
-def _date_to_obj(d: str) -> date | None:
     try:
-        return date.fromisoformat(d)
+        end_obj = date.fromisoformat(end_date_iso)
     except Exception:
-        return None
+        end_obj = None
 
+    cutoff_obj = (end_obj - timedelta(days=179)) if end_obj else None
+    cutoff_iso = cutoff_obj.isoformat() if cutoff_obj else ""
 
-def _safe_int(x):
-    try:
-        if x is None:
-            return None
-        if isinstance(x, bool):
-            return None
-        if isinstance(x, int):
-            return int(x)
-        if isinstance(x, float):
-            return int(x)
-        s = str(x).strip().replace(",", "")
-        if not s:
-            return None
-        if "." in s:
-            s = s.split(".", 1)[0]
-        return int(s)
-    except Exception:
-        return None
+    # Build new events from this run
+    new_events = {}
+    new_count_raw = 0
 
-
-# -----------------------------
-# MASSIVE FLOAT GATE
-# -----------------------------
-def load_float_cache() -> dict:
-    if not os.path.exists(FLOAT_CACHE_PATH):
-        return {}
-    try:
-        obj = read_json_file(FLOAT_CACHE_PATH)
-        return obj if isinstance(obj, dict) else {}
-    except Exception:
-        return {}
-
-
-def save_float_cache(cache: dict):
-    write_file_text(FLOAT_CACHE_PATH, json.dumps(cache, indent=2, sort_keys=True))
-
-
-def massive_get_float_records(ticker: str) -> tuple[bool, dict | None, str | None]:
-    url_template = os.getenv("MASSIVE_FLOAT_URL_TEMPLATE", "").strip()
-    api_key = os.getenv("MASSIVE_API_KEY", "").strip()
-
-    if not url_template or not api_key:
-        return False, None, "Missing MASSIVE_FLOAT_URL_TEMPLATE or MASSIVE_API_KEY"
-
-    url = url_template.replace("{ticker}", ticker)
-
-    headers = {
-        "Accept": "application/json",
-        "Accept-Encoding": "identity",
-        "Connection": "close",
-        "Authorization": f"Bearer {api_key}",  # Massive supports this, per your docs
-        "User-Agent": "DilutionTickerScanner/1.1.1",
-    }
-
-    last_exc = None
-    for attempt in range(1, 4):
-        try:
-            resp = requests.get(url, headers=headers, timeout=30)
-            if resp.status_code != 200:
-                return False, None, f"Non-200 (status={resp.status_code})"
-            try:
-                return True, resp.json(), None
-            except Exception:
-                return False, None, "JSON decode failed"
-        except Exception as e:
-            last_exc = e
-            time.sleep(attempt)
-
-    return False, None, f"Request failed after retries: {last_exc}"
-
-
-def _extract_effective_date_str(obj: dict) -> str:
-    for k in ["effective_date", "effectiveDate", "asOfDate", "as_of_date", "date", "dt"]:
-        v = obj.get(k)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    return ""
-
-
-def _extract_float_shares(obj: dict) -> int | None:
-    keys = [
-        "free_float_shares",
-        "freeFloatShares",
-        "free_float",
-        "freeFloat",
-        "float_shares",
-        "floatShares",
-        "float",
-        "shares",
-    ]
-    for k in keys:
-        if k in obj:
-            val = _safe_int(obj.get(k))
-            if val is not None:
-                return val
-    return None
-
-
-def pick_float_from_massive_response(resp_obj: dict) -> tuple[int | None, str, list[dict]]:
-    candidates = []
-
-    def add_record(rec):
-        if not isinstance(rec, dict):
-            return
-        fs = _extract_float_shares(rec)
-        eds = _extract_effective_date_str(rec)
-        candidates.append({"float_shares": fs, "effective_date": eds, "raw": rec})
-
-    if isinstance(resp_obj, dict):
-        for key in ["results", "data", "floats", "records", "items"]:
-            v = resp_obj.get(key)
-            if isinstance(v, list):
-                for rec in v:
-                    add_record(rec)
-        if not candidates:
-            add_record(resp_obj)
-
-    def parse_date(dstr: str):
-        if not dstr:
-            return "0000-00-00"
-        s = dstr.strip()
-        if len(s) >= 10 and s[4] == "-" and s[7] == "-":
-            return s[:10]
-        if len(s) == 8 and s.isdigit():
-            return f"{s[0:4]}-{s[4:6]}-{s[6:8]}"
-        if "T" in s and len(s) >= 10:
-            head = s.split("T", 1)[0]
-            if len(head) == 10:
-                return head
-        return "0000-00-00"
-
-    valid = []
-    for c in candidates:
-        fs = c.get("float_shares")
-        if fs is None:
+    for r in (matched_allowed_all or []):
+        tkr = str(r.get("ticker") or "").strip().upper()
+        labels = r.get("labels") or []
+        if not tkr or not labels:
             continue
-        ed = parse_date(c.get("effective_date", ""))
-        valid.append((ed, fs, c))
 
-    if not valid:
-        return None, "", candidates
+        dstr = str(r.get("date") or "").strip()
+        dobj = _date_to_obj(dstr)
+        if not dobj:
+            continue
 
-    valid.sort(key=lambda t: (t[0], t[1]))
-    best = valid[-1]
-    return best[1], best[0], candidates
+        filename = str(r.get("filename") or "").strip()
+        filing_url = str(r.get("index_url") or "").strip()
+        cik = str(r.get("cik") or "").strip()
+        form_type = str(r.get("form_type") or "").strip()
+        matched_terms = r.get("matched_terms") or []
 
+        labels_norm = sorted(set([str(x) for x in labels if str(x)]))
+        terms_norm = sorted(set([str(x) for x in matched_terms if str(x)]))
 
-def csv_lines_for_float_gate(rows: list[dict]) -> str:
-    cols = ["ticker", "float_shares", "effective_date", "status", "source", "error"]
-    out = [",".join(cols) + "\n"]
-    for r in rows:
-        out.append(
-            ",".join(
-                [
-                    csv_escape(r.get("ticker", "")),
-                    csv_escape(r.get("float_shares", "")),
-                    csv_escape(r.get("effective_date", "")),
-                    csv_escape(r.get("status", "")),
-                    csv_escape(r.get("source", "")),
-                    csv_escape(r.get("error", "")),
-                ]
-            )
-            + "\n"
-        )
-    return "".join(out)
+        bank_score = _severity_bank_score(terms_norm)
+        term_score = _severity_term_score(terms_norm)
+        final_score = _severity_final_filing_score(labels=labels_norm, matched_terms=terms_norm)
+
+        ek = _severity_event_key(tkr, dstr, filename)
+        new_count_raw += 1
+        new_events[ek] = {
+            "event_key": ek,
+            "date": dstr,
+            "ticker": tkr,
+            "cik": cik,
+            "form_type": form_type,
+            "filename": filename,
+            "filing_url": filing_url,
+            "labels": "|".join(labels_norm),
+            "matched_terms": "|".join(terms_norm),
+            "bank_score": str(int(bank_score)),
+            "term_score": str(int(term_score)),
+            "final_filing_score": str(int(final_score)),
+        }
+
+    # Merge (dedupe by event_key; new overrides old deterministically)
+    merged = dict(prior)
+    for ek in sorted(new_events.keys()):
+        merged[ek] = new_events[ek]
+
+    merged_count = len(merged)
+
+    # Prune
+    kept = {}
+    removed = 0
+    for ek in sorted(merged.keys()):
+        rec = merged[ek]
+        dobj = _date_to_obj(rec.get("date", ""))
+        if cutoff_obj and dobj and dobj < cutoff_obj:
+            removed += 1
+            continue
+        if cutoff_obj and not dobj:
+            # deterministic hygiene: drop unparseable
+            removed += 1
+            continue
+        kept[ek] = rec
+
+    final_count = len(kept)
+
+    _write_severity_events_csv(SEVERITY_EVENTS_OUT, kept)
+
+    if audit is not None:
+        audit["severity_events_master"] = {
+            "prior_source": prior_source,
+            "prior_count": prior_count,
+            "new_events_raw": new_count_raw,
+            "new_events_unique": len(new_events),
+            "merged_count": merged_count,
+            "removed_pruned_count": removed,
+            "final_count": final_count,
+            "cutoff_date_inclusive_180d_window": cutoff_iso,
+            "output_path": SEVERITY_EVENTS_OUT,
+            "root_path": SEVERITY_EVENTS_ROOT,
+        }
+
+    # Return as list for downstream severity build
+    out_list = []
+    for ek in sorted(kept.keys()):
+        out_list.append(dict(kept[ek]))
+    return out_list
 
 
 # -----------------------------
 # v1.1.0/v1.1.1 — SEVERITY INTELLIGENCE (ADDITIVE)
 # -----------------------------
+
 LABEL_WEIGHT = {
     "dilution_bank": 5,
     "pipe_financing": 3,
     "convert_financing": 3,
 }
 
+# LOCKED bank weights (tier 1–5 based on FINRA final regulatory event tiering)
 BANK_WEIGHT = {
-    "aegis capital": 5,
+    # tier 5
+    "h.c. wainwright": 5,
+    "hc wainwright": 5,
     "maxim group": 5,
     "maxim": 5,
-    "a.g.p.": 4,
-    "agp": 4,
-    "alliance global partners": 4,
-    "h.c. wainwright": 4,
-    "hc wainwright": 4,
-    "roth capital": 4,
-    "roth mkms": 4,
-    "westpark capital": 3,
+    "roth capital": 5,
+    "roth": 5,
+    "ladenburg thalmann": 5,
+    "ladenburg": 5,
+    "a.g.p.": 5,
+    "agp": 5,
+    # tier 4
+    "b. riley": 4,
+    "b.riley": 4,
+    "b riley": 4,
+    "b. riley securities": 4,
+    "briley": 4,
+    "ladenburg thalmann & co.": 4,
+    "l.p.": 4,
+    "benjamin": 4,
+    # tier 3
+    "canaccord": 3,
+    "raymond james": 3,
+    "jefferies": 3,
+    "cowen": 3,
     "thinkequity": 3,
-    "boustead securities": 2,
-    "benjamin securities": 2,
-    "ef hutton": 1,
+    # tier 2
+    "cantor": 2,
+    "wedbush": 2,
+    "btig": 2,
+    "stifel": 2,
+    "piper sandler": 2,
+    # tier 1
+    "goldman": 1,
+    "morgan stanley": 1,
+    "j.p. morgan": 1,
+    "jp morgan": 1,
+    "citigroup": 1,
+    "citi": 1,
 }
 
+# LOCKED term weights (convertible-heavy language dominates)
 TERM_WEIGHT = {
-    # Convert (highest)
-    "convertible note": 5,
-    "convertible notes": 5,
-    "convertible debenture": 5,
-    "convertible debentures": 5,
-    "senior convertible": 4,
-    "conversion price": 4,
-    "conversion feature": 4,
-    "convertible preferred": 4,
-    "variable rate": 5,
-    "reset price": 5,
-    "price reset": 5,
-    # PIPE / structures (medium)
-    "pipe financing": 3,
-    "private investment in public equity": 3,
-    "private investment in public equities": 3,
-    "private placement": 3,
-    "registered direct": 3,
-    # Facilities (lower)
-    "equity line of credit": 2,
-    "at-the-market": 2,
     "at the market": 2,
-    "atm offering": 2,
-    "eloc": 2,
+    "atm": 2,
+    "equity line": 2,
+    "equity purchase": 2,
+    "equity purchase agreement": 3,
+    "registered direct offering": 3,
+    "rdo": 3,
+    "private placement": 3,
+    "pipe": 3,
+    "purchase agreement": 2,
+    "commitment": 1,
+    "underwriter": 2,
+    "placement agent": 2,
+    "selling stockholder": 2,
+    "resale registration statement": 3,
+    "resale": 1,
+    "convertible": 4,
+    "convertible note": 5,
+    "convertible debenture": 5,
+    "senior convertible": 5,
+    "secured convertible": 5,
+    "convertible preferred": 4,
+    "conversion price": 4,
+    "conversion rate": 3,
+    "conversion": 2,
+    "variable conversion": 5,
+    "floor price": 3,
+    "reset": 3,
+    "anti-dilution": 4,
+    "down round": 4,
+    "price protection": 3,
+    "beneficial ownership limitation": 3,
+    "9.99%": 2,
+    "4.99%": 2,
+    "beneficial ownership": 2,
+    "cashless exercise": 3,
+    "pre-funded": 2,
+    "pre funded": 2,
+    "warrant": 2,
+    "warrants": 2,
+    "exercise price": 2,
+    "exercise": 1,
+    "registration rights": 3,
+    "registration rights agreement": 3,
 }
 
-# Integer multipliers to avoid float nondeterminism
-BANK_MULTIPLIER_BPS = {
+BANK_MULTIPLIER = {
     0: 100,
     1: 105,
     2: 110,
@@ -634,46 +625,62 @@ BANK_MULTIPLIER_BPS = {
     5: 150,
 }
 
-# v1.1.1 — Avoid flag thresholds (LOCKED)
-BANK_BACKSTOP_MIN = 4     # Tier B+
-TERM_BACKSTOP_MIN = 8     # Toxic cluster
-FINAL_SEVERITY_MIN = 20   # Minimum 90d severity when bank is strong
+BANK_BACKSTOP_MIN = 4
+TERM_BACKSTOP_MIN = 8
+FINAL_SEVERITY_MIN = 20
 
 
 def _severity_label_score(labels: list[str]) -> int:
-    uniq = sorted(set([str(x) for x in (labels or []) if str(x)]))
+    unique = sorted(set([str(x) for x in (labels or []) if str(x)]))
     s = 0
-    for lab in uniq:
-        s += LABEL_WEIGHT.get(lab, 0)
-    return s
+    for lab in unique:
+        s += int(LABEL_WEIGHT.get(lab, 0))
+    return int(s)
 
 
 def _severity_bank_score(matched_terms: list[str]) -> int:
+    """
+    bank_score = max matched bank weight across matched_terms
+    """
+    terms = [str(x) for x in (matched_terms or [])]
     best = 0
-    for t in (matched_terms or []):
-        w = BANK_WEIGHT.get(t, 0)
-        if w > best:
-            best = w
-    return best
+    for b, w in BANK_WEIGHT.items():
+        if b in terms:
+            if int(w) > best:
+                best = int(w)
+    return int(best)
 
 
 def _severity_term_score(matched_terms: list[str]) -> int:
+    """
+    term_score = sum TERM_WEIGHT for matched_terms (unique terms only)
+    """
+    terms = sorted(set([str(x) for x in (matched_terms or []) if str(x)]))
     s = 0
-    for t in (matched_terms or []):
-        s += TERM_WEIGHT.get(t, 0)
-    return s
+    for t in terms:
+        s += int(TERM_WEIGHT.get(t, 0))
+    return int(s)
 
 
 def _severity_final_filing_score(labels: list[str], matched_terms: list[str]) -> int:
+    """
+    LOCKED — Option C Multiplier
+
+    label_score = sum(unique label weights)
+    bank_score  = max matched bank weight
+    term_score  = sum term weights
+
+    term_component = (term_score * BANK_MULTIPLIER[bank_score]) // 100
+    final_filing_score = label_score + term_component + bank_score
+    """
     label_score = _severity_label_score(labels)
     bank_score = _severity_bank_score(matched_terms)
     term_score = _severity_term_score(matched_terms)
 
-    mult = BANK_MULTIPLIER_BPS.get(bank_score, 100)
-    term_component = (term_score * mult) // 100
+    mult = int(BANK_MULTIPLIER.get(int(bank_score), 100))
+    term_component = (int(term_score) * int(mult)) // 100
 
-    # Option C combined score
-    return label_score + term_component + bank_score
+    return int(label_score + int(term_component) + int(bank_score))
 
 
 def _write_severity_csv(path: str, rows: list[dict]):
@@ -687,7 +694,6 @@ def _write_severity_csv(path: str, rows: list[dict]):
         "last_labels",
         "top_terms",
         "top_banks",
-        # v1.1.1 additive
         "max_bank_score_180d",
         "term_score_90d",
         "avoid_flag",
@@ -698,12 +704,12 @@ def _write_severity_csv(path: str, rows: list[dict]):
     write_file_text(path, "".join(lines))
 
 
-def build_dilution_severity_by_ticker(matched_allowed_all: list[dict], end_date_iso: str):
+def build_dilution_severity_by_ticker_from_events(events_all: list[dict], end_date_iso: str):
     """
     Additive v1.1.x artifact:
       output/dilution_severity_by_ticker.csv
 
-    Uses only in-memory matched_allowed_all + end_date.
+    Uses pruned severity events master + end_date.
     No new API calls.
     Deterministic ordering and integer scoring.
     """
@@ -717,27 +723,31 @@ def build_dilution_severity_by_ticker(matched_allowed_all: list[dict], end_date_
 
     by_ticker = {}
 
-    # Include only rows with labels AND ticker present (matches v1.0.0 “matched” definition)
-    for r in (matched_allowed_all or []):
-        tkr = str(r.get("ticker") or "").strip().upper()
-        labels = r.get("labels") or []
+    # Include only events with required fields
+    for ev in (events_all or []):
+        tkr = str(ev.get("ticker") or "").strip().upper()
+        labels_str = str(ev.get("labels") or "").strip()
         if not tkr:
             continue
-        if not labels:
+        if not labels_str:
             continue
 
-        dstr = str(r.get("date") or "").strip()
+        dstr = str(ev.get("date") or "").strip()
         try:
             dobj = date.fromisoformat(dstr)
         except Exception:
             continue
 
-        matched_terms = r.get("matched_terms") or []
-        filename = str(r.get("filename") or "").strip()
+        filename = str(ev.get("filename") or "").strip()
+        matched_terms_str = str(ev.get("matched_terms") or "").strip()
 
-        bank_score = _severity_bank_score(matched_terms)
-        term_score = _severity_term_score(matched_terms)
-        filing_score = _severity_final_filing_score(labels=labels, matched_terms=matched_terms)
+        matched_terms = [x for x in matched_terms_str.split("|") if x] if matched_terms_str else []
+        labels = [x for x in labels_str.split("|") if x] if labels_str else []
+
+        # Prefer stored deterministic values; fall back to recompute if blank
+        bank_score = _safe_int(ev.get("bank_score")) or _severity_bank_score(matched_terms)
+        term_score = _safe_int(ev.get("term_score")) or _severity_term_score(matched_terms)
+        filing_score = _safe_int(ev.get("final_filing_score")) or _severity_final_filing_score(labels=labels, matched_terms=matched_terms)
 
         item = {
             "date": dobj,
@@ -755,826 +765,437 @@ def build_dilution_severity_by_ticker(matched_allowed_all: list[dict], end_date_
     out_rows = []
 
     for tkr in sorted(by_ticker.keys()):
-        items = by_ticker[tkr]
+        items = sorted(
+            by_ticker[tkr],
+            key=lambda x: (x["date_iso"], x.get("filename", "")),
+        )
 
-        sev_90 = 0
-        sev_180 = 0
-        cnt_90 = 0
-        cnt_180 = 0
+        # windows
+        items_90 = [x for x in items if x["date"] >= start_90 and x["date"] <= end_obj]
+        items_180 = [x for x in items if x["date"] >= start_180 and x["date"] <= end_obj]
 
-        term_freq = {}
-        bank_freq = {}
+        severity_90 = sum([x["filing_score"] for x in items_90])
+        severity_180 = sum([x["filing_score"] for x in items_180])
 
-        # v1.1.1 aggregates
-        max_bank_180 = 0
+        match_count_90 = len(items_90)
+        match_count_180 = len(items_180)
+
+        last_seen_date = items[-1]["date_iso"] if items else ""
+        last_labels = "|".join(sorted(set(sum([x["labels"] for x in items], []))))
+
+        # top terms/banks: deterministic counts then alpha
+        term_counts = {}
+        bank_counts = {}
+
+        max_bank_score_180 = 0
         term_score_90 = 0
 
-        # last seen (deterministic tie-break: (date_iso, filename) max)
-        last_key = None
-        last_seen_date = ""
-        last_labels = []
+        for x in items_180:
+            if x["bank_score"] > max_bank_score_180:
+                max_bank_score_180 = x["bank_score"]
+            for t in x["matched_terms"]:
+                term_counts[t] = term_counts.get(t, 0) + 1
 
-        for it in items:
-            d = it["date"]
-            score = int(it["filing_score"])
-            bsc = int(it.get("bank_score", 0))
-            tsc = int(it.get("term_score", 0))
+            # include matched banks only (terms list already contains bank substrings)
+            for b in BANK_WEIGHT.keys():
+                if b in x["matched_terms"]:
+                    bank_counts[b] = bank_counts.get(b, 0) + 1
 
-            if d >= start_180 and d <= end_obj:
-                sev_180 += score
-                cnt_180 += 1
+        for x in items_90:
+            term_score_90 += x["term_score"]
 
-                if bsc > max_bank_180:
-                    max_bank_180 = bsc
+        top_terms = "|".join([k for k, _v in sorted(term_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:10]])
+        top_banks = "|".join([k for k, _v in sorted(bank_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:10]])
 
-                # top terms / banks computed from 180d window only
-                for term in it["matched_terms"]:
-                    if term in TERM_WEIGHT:
-                        term_freq[term] = term_freq.get(term, 0) + 1
-                    if term in BANK_WEIGHT:
-                        bank_freq[term] = bank_freq.get(term, 0) + 1
-
-                key = (it["date_iso"], it["filename"])
-                if (last_key is None) or (key > last_key):
-                    last_key = key
-                    last_seen_date = it["date_iso"]
-                    last_labels = it["labels"]
-
-            if d >= start_90 and d <= end_obj:
-                sev_90 += score
-                cnt_90 += 1
-                term_score_90 += tsc
-
-        top_terms_list = sorted(term_freq.items(), key=lambda kv: (-kv[1], kv[0]))[:3]
-        top_banks_list = sorted(bank_freq.items(), key=lambda kv: (-kv[1], kv[0]))[:3]
-
-        top_terms = "|".join([k for k, _v in top_terms_list])
-        top_banks = "|".join([k for k, _v in top_banks_list])
-
-        # v1.1.1 avoid flag (locked thresholds)
         avoid_flag = 0
-        if ((max_bank_180 >= BANK_BACKSTOP_MIN) and (sev_90 >= FINAL_SEVERITY_MIN)) or (term_score_90 >= TERM_BACKSTOP_MIN):
+        if (max_bank_score_180 >= BANK_BACKSTOP_MIN and severity_90 >= FINAL_SEVERITY_MIN) or (term_score_90 >= TERM_BACKSTOP_MIN):
             avoid_flag = 1
 
         out_rows.append(
             {
                 "ticker": tkr,
-                "severity_score_90d": str(sev_90),
-                "severity_score_180d": str(sev_180),
-                "match_count_90d": str(cnt_90),
-                "match_count_180d": str(cnt_180),
+                "severity_score_90d": int(severity_90),
+                "severity_score_180d": int(severity_180),
+                "match_count_90d": int(match_count_90),
+                "match_count_180d": int(match_count_180),
                 "last_seen_date": last_seen_date,
-                "last_labels": "|".join(sorted(set(last_labels))) if last_labels else "",
+                "last_labels": last_labels,
                 "top_terms": top_terms,
                 "top_banks": top_banks,
-                "max_bank_score_180d": str(max_bank_180),
-                "term_score_90d": str(term_score_90),
-                "avoid_flag": str(avoid_flag),
+                "max_bank_score_180d": int(max_bank_score_180),
+                "term_score_90d": int(term_score_90),
+                "avoid_flag": int(avoid_flag),
             }
         )
 
-    def _to_int(s):
-        try:
-            return int(str(s))
-        except Exception:
-            return 0
+    out_rows = sorted(
+        out_rows,
+        key=lambda r: (-r["severity_score_90d"], -r["severity_score_180d"], r["ticker"]),
+    )
 
-    # sort: severity_score_90d desc, severity_score_180d desc, ticker asc
-    out_rows.sort(key=lambda r: (-_to_int(r["severity_score_90d"]), -_to_int(r["severity_score_180d"]), r["ticker"]))
-
-    _write_severity_csv(f"{OUTPUT_DIR}/dilution_severity_by_ticker.csv", out_rows)
+    _write_severity_csv(path=f"{OUTPUT_DIR}/dilution_severity_by_ticker.csv", rows=out_rows)
 
 
-# -----------------------------
-# v1.1.1 additive — AVOID TICKERS EXPORT
-# -----------------------------
 def write_avoid_tickers_csv():
     """
-    Deterministically derive output/avoid_tickers.csv from output/dilution_severity_by_ticker.csv.
+    v1.1.1 derived file:
+      output/avoid_tickers.csv (one column: ticker)
 
-    Schema:
-      ticker
-
-    Rule:
-      include ticker where avoid_flag == 1
-
-    Ordering:
-      ticker asc (deterministic)
+    Built from output/dilution_severity_by_ticker.csv where avoid_flag == 1
+    Deterministic sort: ticker asc
     """
-    severity_path = f"{OUTPUT_DIR}/dilution_severity_by_ticker.csv"
-    if not os.path.exists(severity_path):
+    if not os.path.exists(SEVERITY_BY_TICKER_CSV):
+        write_file_text(AVOID_TICKERS_CSV, "ticker\n")
         return
 
-    avoid = []
+    rows = _read_csv_dicts(SEVERITY_BY_TICKER_CSV)
+    tickers = []
+    for r in rows:
+        if _safe_int(r.get("avoid_flag")) == 1:
+            t = str(r.get("ticker") or "").strip().upper()
+            if t:
+                tickers.append(t)
 
-    with open(severity_path, "r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            if row.get("avoid_flag") == "1":
-                t = (row.get("ticker") or "").strip().upper()
-                if t:
-                    avoid.append(t)
+    tickers = sorted(set(tickers))
+    lines = ["ticker\n"]
+    for t in tickers:
+        lines.append(f"{csv_escape(t)}\n")
+    write_file_text(AVOID_TICKERS_CSV, "".join(lines))
 
-    avoid = sorted(set(avoid))
 
-    with open(AVOID_TICKERS_CSV, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["ticker"])
-        for t in avoid:
-            w.writerow([t])
+def _merge_master_verbose(existing: list[dict], new_matches: list[dict], end_date_iso: str) -> list[dict]:
+    """
+    Merge new matches into persistent master:
+      - existing is dilution_tickers_all_verbose.csv content (repo root)
+      - new_matches is today's matched + float-gated records
+
+    Locked behavior:
+      - update last_seen_date, seen_count, last_labels, last_filing_url
+      - first_seen_date remains unchanged
+    """
+    existing_map = {}
+    for r in existing:
+        t = str(r.get("ticker") or "").strip().upper()
+        if not t:
+            continue
+        existing_map[t] = {
+            "ticker": t,
+            "first_seen_date": str(r.get("first_seen_date") or "").strip(),
+            "last_seen_date": str(r.get("last_seen_date") or "").strip(),
+            "seen_count": _safe_int(r.get("seen_count"), default=0),
+            "last_labels": str(r.get("last_labels") or "").strip(),
+            "last_filing_url": str(r.get("last_filing_url") or "").strip(),
+        }
+
+    # deterministic: sort new matches by ticker, date, filename
+    def nm_key(x):
+        return (
+            str(x.get("ticker") or "").strip().upper(),
+            str(x.get("date") or "").strip(),
+            str(x.get("filename") or "").strip(),
+        )
+
+    new_sorted = sorted(new_matches, key=nm_key)
+
+    for r in new_sorted:
+        t = str(r.get("ticker") or "").strip().upper()
+        if not t:
+            continue
+        d = str(r.get("date") or "").strip()
+
+        labels = r.get("labels") or []
+        labels_str = "|".join(sorted(set([str(x) for x in labels if str(x)])))
+        filing_url = str(r.get("index_url") or "").strip()
+
+        if t not in existing_map:
+            existing_map[t] = {
+                "ticker": t,
+                "first_seen_date": d,
+                "last_seen_date": d,
+                "seen_count": 1,
+                "last_labels": labels_str,
+                "last_filing_url": filing_url,
+            }
+        else:
+            rec = existing_map[t]
+            rec["last_seen_date"] = d
+            rec["seen_count"] = int(rec.get("seen_count", 0)) + 1
+            rec["last_labels"] = labels_str
+            rec["last_filing_url"] = filing_url
+            existing_map[t] = rec
+
+    # prune (locked): remove ticker if last_seen_date < END_DATE - 180 days
+    try:
+        end_obj = date.fromisoformat(end_date_iso)
+    except Exception:
+        end_obj = None
+
+    cutoff = (end_obj - timedelta(days=MASTER_PRUNE_DAYS)) if end_obj else None
+
+    out = []
+    for t in sorted(existing_map.keys()):
+        rec = existing_map[t]
+        if cutoff:
+            last = _date_to_obj(rec.get("last_seen_date"))
+            if not last:
+                continue
+            if last < cutoff:
+                continue
+        out.append(rec)
+
+    return out
+
+
+def _derive_all_summary(master_verbose: list[dict]) -> list[dict]:
+    out = []
+    for r in master_verbose:
+        out.append(
+            {
+                "ticker": r.get("ticker", ""),
+                "first_seen_date": r.get("first_seen_date", ""),
+                "last_seen_date": r.get("last_seen_date", ""),
+                "seen_count": r.get("seen_count", ""),
+            }
+        )
+    return out
+
+
+def _normalize_matched_row(row: dict) -> dict:
+    """
+    Normalize matched row for verbose output.
+    """
+    labels = row.get("labels") or []
+    matched_terms = row.get("matched_terms") or []
+    return {
+        "date": str(row.get("date") or "").strip(),
+        "cik": str(row.get("cik") or "").strip(),
+        "ticker": str(row.get("ticker") or "").strip().upper(),
+        "company_name": str(row.get("company_name") or "").strip(),
+        "form_type": str(row.get("form_type") or "").strip(),
+        "filename": str(row.get("filename") or "").strip(),
+        "index_url": str(row.get("index_url") or "").strip(),
+        "labels": "|".join(sorted(set([str(x) for x in labels if str(x)]))),
+        "matched_terms": "|".join(sorted(set([str(x) for x in matched_terms if str(x)]))),
+    }
+
+
+def _normalize_summary_row(row: dict) -> dict:
+    labels = row.get("labels") or []
+    return {
+        "date": str(row.get("date") or "").strip(),
+        "ticker": str(row.get("ticker") or "").strip().upper(),
+        "labels": "|".join(sorted(set([str(x) for x in labels if str(x)]))),
+        "index_url": str(row.get("index_url") or "").strip(),
+    }
+
+
+def _read_master_verbose_repo_root() -> list[dict]:
+    path = "dilution_tickers_all_verbose.csv"
+    return _read_csv_dicts(path)
+
+
+def _write_master_verbose_output(master_rows: list[dict]):
+    _write_csv_dicts(f"{OUTPUT_DIR}/dilution_tickers_all_verbose.csv", ALL_VERBOSE_COLUMNS, master_rows)
+
+
+def _write_master_summary_output(master_rows: list[dict]):
+    summary = _derive_all_summary(master_rows)
+    _write_csv_dicts(f"{OUTPUT_DIR}/dilution_tickers_all.csv", ALL_SUMMARY_COLUMNS, summary)
+
+
+def _filingref_to_row(d: str, ref: FilingRef) -> dict:
+    return {
+        "date": d,
+        "cik": ref.cik,
+        "ticker": ref.ticker or "",
+        "company_name": ref.company_name or "",
+        "form_type": ref.form_type or "",
+        "filename": ref.filename or "",
+        "index_url": ref.index_url or "",
+        "labels": [],
+        "matched_terms": [],
+    }
+
+
+def _write_sample_filing_fetch(sample: dict):
+    write_file_text(f"{OUTPUT_DIR}/sample_filing_fetch.json", _json_dump_stable(sample))
 
 
 def main():
     ensure_output_dir()
 
-    run_time = datetime.now(timezone.utc).isoformat()
-    start_date, end_date, date_mode = parse_dates()
-    dates = iter_date_range_inclusive(start_date, end_date)
+    # Inputs
+    start_date = os.environ.get("START_DATE", "").strip()
+    end_date = os.environ.get("END_DATE", "").strip()
 
-    audit = new_audit(run_time_utc=run_time, start_date=start_date, end_date=end_date, date_mode=date_mode)
-    audit_event(audit, "run_start", {"date_mode": date_mode, "start_date": start_date, "end_date": end_date, "days": dates})
+    date_mode = "daily"
+    if start_date and end_date:
+        date_mode = "range"
+    else:
+        # daily mode default: yesterday only
+        end_date = _iso_yesterday_utc()
+        start_date = end_date
 
-    # Load cik->ticker map (once)
-    cik_to_ticker = {}
-    cik_map_ok = False
-    cik_map_error = None
-    cik_map_meta = None
-    try:
-        cik_to_ticker, cik_map_meta = load_cik_to_ticker_map_dual_source()
-        cik_map_ok = True
-    except Exception as e:
-        cik_map_error = str(e)
-        cik_to_ticker = {}
+    dates = _date_range_inclusive(start_date, end_date)
 
-    audit_event(
-        audit,
-        "cik_ticker_map_loaded",
-        {"ok": cik_map_ok, "error": cik_map_error, "meta": cik_map_meta, "count": (len(cik_to_ticker) if cik_map_ok else 0)},
-    )
-
-    # RANGE totals
-    total_parsed_rows = 0
-    total_allowed_rows = 0
-    total_matched_rows = 0
-    total_blank_ticker_rows = 0
-    total_scan_fetch_fail = 0
-    total_scan_skipped_due_to_size = 0
-    total_scan_scanned = 0
-
-    label_counts_total = {}
-    verbose_rows_all = []
-    run_tickers_all = []
-
-    allowed_filings_all = []
-    matched_allowed_all = []
-
-    error_rows_all = []
-
-    # -----------------------------
-    # PASS 1: Build candidate tickers across entire range
-    # -----------------------------
-    audit_event(audit, "float_gate_pass1_start", {"policy": FLOAT_GATE_POLICY, "float_max_shares": FLOAT_MAX_SHARES})
-
-    candidate_ticker_set = set()
-    candidate_ticker_sources = 0
-    blank_ticker_candidates = 0
-
-    for target_date in dates:
-        url = master_idx_url_for_date(target_date)
-        try:
-            resp = sec_get(url)
-            if resp.status_code != 200 or not resp.content:
-                continue
-            text = resp.content.decode("latin-1")
-            parsed_rows = parse_master_idx(text)
-
-            allowed_rows = []
-            for r in parsed_rows:
-                if r.form_type in ("S-1", "S-3", "F-3", "8-K") or r.form_type.startswith("424B"):
-                    allowed_rows.append(r)
-
-            allowed_rows.sort(key=lambda r: (r.form_type, r.cik, r.filename))
-
-            for r in allowed_rows:
-                cik_key = normalize_cik(r.cik)
-                t = cik_to_ticker.get(cik_key, "")
-                if t:
-                    candidate_ticker_set.add(t)
-                    candidate_ticker_sources += 1
-                else:
-                    blank_ticker_candidates += 1
-        except Exception:
-            continue
-
-    candidate_tickers = sorted(candidate_ticker_set)
-
-    audit_event(
-        audit,
-        "float_gate_candidates_built",
-        {
-            "unique_candidate_tickers": len(candidate_tickers),
-            "candidate_sources_rows_with_ticker": candidate_ticker_sources,
-            "candidate_rows_blank_ticker": blank_ticker_candidates,
-        },
-    )
-
-    # -----------------------------
-    # Float gate lookup (no persistence required; cache only within run)
-    # -----------------------------
-    float_cache = load_float_cache()
-    float_gate_api_calls = 0
-
-    pass_rows = []
-    fail_rows = []
-    unknown_rows = []
-    pass_tickers = set()
-
-    for tkr in candidate_tickers:
-        cached = float_cache.get(tkr)
-        if isinstance(cached, dict) and "float_shares" in cached and "effective_date" in cached and "status" in cached:
-            status = str(cached.get("status", "")).strip()
-            fs = _safe_int(cached.get("float_shares"))
-            ed = str(cached.get("effective_date", "")).strip()
-            err = str(cached.get("error", "")).strip()
-            source = "cache"
-
-            if status == "pass" and fs is not None:
-                pass_tickers.add(tkr)
-                pass_rows.append({"ticker": tkr, "float_shares": fs, "effective_date": ed, "status": "pass", "source": source, "error": err})
-            elif status == "fail" and fs is not None:
-                fail_rows.append({"ticker": tkr, "float_shares": fs, "effective_date": ed, "status": "fail", "source": source, "error": err})
-            else:
-                unknown_rows.append({"ticker": tkr, "float_shares": (fs if fs is not None else ""), "effective_date": ed, "status": "unknown", "source": source, "error": err})
-            continue
-
-        ok, obj, err = massive_get_float_records(tkr)
-        float_gate_api_calls += 1
-
-        if not ok or obj is None:
-            float_cache[tkr] = {"status": "unknown", "float_shares": None, "effective_date": "", "error": (err or "unknown_error")}
-            unknown_rows.append({"ticker": tkr, "float_shares": "", "effective_date": "", "status": "unknown", "source": "api", "error": (err or "")})
-            continue
-
-        fs, ed, _records = pick_float_from_massive_response(obj)
-        if fs is None:
-            float_cache[tkr] = {"status": "unknown", "float_shares": None, "effective_date": "", "error": "no_float_in_response"}
-            unknown_rows.append({"ticker": tkr, "float_shares": "", "effective_date": "", "status": "unknown", "source": "api", "error": "no_float_in_response"})
-            continue
-
-        if fs <= FLOAT_MAX_SHARES:
-            float_cache[tkr] = {"status": "pass", "float_shares": fs, "effective_date": ed, "error": ""}
-            pass_tickers.add(tkr)
-            pass_rows.append({"ticker": tkr, "float_shares": fs, "effective_date": ed, "status": "pass", "source": "api", "error": ""})
-        else:
-            float_cache[tkr] = {"status": "fail", "float_shares": fs, "effective_date": ed, "error": ""}
-            fail_rows.append({"ticker": tkr, "float_shares": fs, "effective_date": ed, "status": "fail", "source": "api", "error": ""})
-
-    save_float_cache(float_cache)
-    write_file_text(FLOAT_PASS_CSV, csv_lines_for_float_gate(sorted(pass_rows, key=lambda r: r["ticker"])))
-    write_file_text(FLOAT_FAIL_CSV, csv_lines_for_float_gate(sorted(fail_rows, key=lambda r: r["ticker"])))
-    write_file_text(FLOAT_UNKNOWN_CSV, csv_lines_for_float_gate(sorted(unknown_rows, key=lambda r: r["ticker"])))
-
-    audit["float_gate"] = {
-        "policy": FLOAT_GATE_POLICY,
-        "float_max_shares": FLOAT_MAX_SHARES,
-        "unique_candidate_tickers": len(candidate_tickers),
-        "api_calls": float_gate_api_calls,
-        "pass_tickers": len(pass_tickers),
-        "fail_tickers": len(fail_rows),
-        "unknown_tickers": len(unknown_rows),
-        "cache_path": FLOAT_CACHE_PATH,
-        "pass_csv": FLOAT_PASS_CSV,
-        "fail_csv": FLOAT_FAIL_CSV,
-        "unknown_csv": FLOAT_UNKNOWN_CSV,
-        "massive_url_template_present": bool(os.getenv("MASSIVE_FLOAT_URL_TEMPLATE", "").strip()),
+    # Audit log root
+    audit = {
+        "system_version": SYSTEM_VERSION,
+        "run_timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "start_date": start_date,
+        "end_date": end_date,
+        "date_mode": date_mode,
+        "scan_days": dates,
+        "allowed_forms": ALLOWED_FORMS,
     }
 
-    audit_event(
-        audit,
-        "float_gate_complete",
-        {
-            "unique_candidate_tickers": len(candidate_tickers),
-            "api_calls": float_gate_api_calls,
-            "pass_tickers": len(pass_tickers),
-            "fail_tickers": len(fail_rows),
-            "unknown_tickers": len(unknown_rows),
-        },
-    )
+    # 1) Parse EDGAR master index for each day
+    allowed_filings_all = []
+    parsed_rows_total = 0
 
-    # -----------------------------
-    # PASS 2: Scan filings ONLY for pass_tickers
-    # -----------------------------
-    for target_date in dates:
-        url = master_idx_url_for_date(target_date)
+    for d in dates:
+        parsed = parse_master_idx(d, user_agent=SEC_USER_AGENT)
+        parsed_rows_total += int(parsed.get("parsed_rows", 0))
+        allowed = parsed.get("allowed_filings") or []
+        allowed_filings_all.extend(allowed)
 
-        day_info = {
-            "date": target_date,
-            "master_idx": {"url": url, "ok": False, "status": None, "bytes": 0, "saved_path": None, "error": None},
-            "counts": {
-                "parsed_rows": 0,
-                "allowed_rows": 0,
-                "allowed_rows_after_float_gate": 0,
-                "matched_rows": 0,
-                "blank_ticker_rows": 0,
-                "scan_fetch_fail": 0,
-                "scan_skipped_due_to_size": 0,
-                "scan_scanned": 0,
-                "float_gate_skipped_rows": 0,
-            },
-            "label_counts": {},
-        }
+    # deterministic ordering of allowed filings (date, cik, form_type, filename)
+    def allowed_key(x):
+        return (
+            str(x.get("date") or ""),
+            str(x.get("cik") or ""),
+            str(x.get("form_type") or ""),
+            str(x.get("filename") or ""),
+        )
 
-        audit_event(audit, "day_start", {"date": target_date, "url": url})
+    allowed_filings_all = sorted(allowed_filings_all, key=allowed_key)
 
-        try:
-            resp = sec_get(url)
-            status = resp.status_code
-            content = resp.content or b""
-            fetched_bytes_len = len(content)
+    audit["master_idx"] = {
+        "parsed_rows_total": int(parsed_rows_total),
+        "allowed_filings_total": int(len(allowed_filings_all)),
+    }
 
-            day_info["master_idx"]["status"] = status
-            day_info["master_idx"]["bytes"] = fetched_bytes_len
+    # 2) Fetch filing text + apply literal substring rules
+    matched_allowed_all = []
+    sample_capture = None
 
-            if status != 200 or fetched_bytes_len <= 0:
-                day_info["master_idx"]["ok"] = False
-                day_info["master_idx"]["error"] = f"Non-200 or empty body (status={status}, bytes={fetched_bytes_len})"
-                audit_event(audit, "master_idx_fetched", {"date": target_date, "ok": False, "status": status, "bytes": fetched_bytes_len, "url": url})
-                audit["by_date"].append(day_info)
-                audit_event(audit, "day_end", {"date": target_date, "ok": False, "error": day_info["master_idx"]["error"]})
-                continue
+    for r in allowed_filings_all:
+        ref = FilingRef(
+            date=str(r.get("date") or ""),
+            cik=str(r.get("cik") or ""),
+            ticker=str(r.get("ticker") or ""),
+            company_name=str(r.get("company_name") or ""),
+            form_type=str(r.get("form_type") or ""),
+            filename=str(r.get("filename") or ""),
+            index_url=str(r.get("index_url") or ""),
+        )
 
-            master_path = f"{OUTPUT_DIR}/master_{target_date}.idx"
-            write_file_bytes(master_path, content)
-            day_info["master_idx"]["ok"] = True
-            day_info["master_idx"]["saved_path"] = master_path
+        txt = fetch_primary_filing_text(ref=ref, user_agent=SEC_USER_AGENT)
+        found = scan_filing_text_for_labels(txt)
 
-            audit_event(audit, "master_idx_fetched", {"date": target_date, "ok": True, "status": status, "bytes": fetched_bytes_len, "url": url, "saved_path": master_path})
+        # found: {"labels":[...], "matched_terms":[...]}
+        labels = found.get("labels") or []
+        matched_terms = found.get("matched_terms") or []
 
-            text = content.decode("latin-1")
-            parsed_rows = parse_master_idx(text)
-            parsed_row_count = len(parsed_rows)
+        if labels:
+            row = _filingref_to_row(ref.date, ref)
+            row["labels"] = labels
+            row["matched_terms"] = matched_terms
+            matched_allowed_all.append(row)
 
-            allowed_rows = []
-            for r in parsed_rows:
-                if r.form_type in ("S-1", "S-3", "F-3", "8-K") or r.form_type.startswith("424B"):
-                    allowed_rows.append(r)
+            # capture a deterministic sample (first match in deterministic order)
+            if sample_capture is None:
+                sample_capture = {
+                    "date": ref.date,
+                    "cik": ref.cik,
+                    "ticker": ref.ticker,
+                    "company_name": ref.company_name,
+                    "form_type": ref.form_type,
+                    "filename": ref.filename,
+                    "index_url": ref.index_url,
+                    "labels": labels,
+                    "matched_terms": matched_terms,
+                    "filing_text_first_1200": (txt or "")[:1200],
+                }
 
-            allowed_row_count = len(allowed_rows)
-            day_info["counts"]["parsed_rows"] = parsed_row_count
-            day_info["counts"]["allowed_rows"] = allowed_row_count
+    if sample_capture is None:
+        sample_capture = {"note": "no matched filings in this run"}
 
-            audit_event(audit, "master_idx_parsed", {"date": target_date, "parsed_rows": parsed_row_count, "allowed_rows": allowed_row_count})
+    _write_sample_filing_fetch(sample_capture)
 
-            allowed_rows.sort(key=lambda r: (r.form_type, r.cik, r.filename))
+    audit["matching"] = {
+        "matched_allowed_count": int(len(matched_allowed_all)),
+    }
 
-            allowed_filings = []
-            float_gate_skipped = 0
+    # 3) Float gate (Massive API) — apply to matched tickers only
+    matched_tickers = []
+    for r in matched_allowed_all:
+        t = str(r.get("ticker") or "").strip().upper()
+        if t:
+            matched_tickers.append(t)
 
-            for r in allowed_rows:
-                cik_key = normalize_cik(r.cik)
-                tkr = cik_to_ticker.get(cik_key, "")
-                if not tkr:
-                    float_gate_skipped += 1
-                    continue
-                if tkr not in pass_tickers:
-                    float_gate_skipped += 1
-                    continue
+    pass_tickers, pass_rows, fail_rows, unknown_rows = _float_gate_for_tickers(matched_tickers, audit=audit)
 
-                allowed_filings.append(
-                    {
-                        "date": target_date,
-                        "cik": r.cik,
-                        "company": r.company,
-                        "form_type": r.form_type,
-                        "date_filed": r.date_filed,
-                        "filename": r.filename,
-                        "index_url": f"https://www.sec.gov/Archives/{r.filename}",
-                        "ticker": tkr,
-                    }
-                )
+    write_file_text(FLOAT_GATE_PASS_CSV, csv_lines_for_float_gate(pass_rows))
+    write_file_text(FLOAT_GATE_FAIL_CSV, csv_lines_for_float_gate(fail_rows))
+    write_file_text(FLOAT_GATE_UNKNOWN_CSV, csv_lines_for_float_gate(unknown_rows))
 
-            allowed_filings.sort(key=lambda x: (x["form_type"], x["cik"], x["filename"]))
-
-            day_info["counts"]["float_gate_skipped_rows"] = float_gate_skipped
-            day_info["counts"]["allowed_rows_after_float_gate"] = len(allowed_filings)
-
-            allowed_filings_all.extend(allowed_filings)
-
-            label_counts_day = {}
-            matched_rows_day = 0
-            blank_ticker_day = 0
-
-            scan_fetch_fail_day = 0
-            scan_skipped_due_to_size_day = 0
-            scan_scanned_day = 0
-
-            for item in allowed_filings:
-                filing = FilingRef(
-                    cik=item["cik"],
-                    company=item["company"],
-                    form_type=item["form_type"],
-                    date_filed=item["date_filed"],
-                    filename=item["filename"],
-                    index_url=item["index_url"],
-                )
-
-                ok, content_bytes, err_str, http_status = fetch_primary_filing_text(
-                    filing=filing,
-                    user_agent=SEC_USER_AGENT,
-                )
-
-                bytes_len = (len(content_bytes) if content_bytes is not None else 0)
-                skipped_due_to_size = False
-                labels = []
-                matched_terms = []
-
-                if ok and content_bytes is not None:
-                    skipped_due_to_size = bytes_len > MAX_SAMPLE_BYTES
-                    if not skipped_due_to_size:
-                        filing_text = content_bytes.decode("utf-8", errors="replace")
-                        labels, matched_terms = scan_filing_text_for_labels(filing_text)
-
-                if not ok:
-                    scan_fetch_fail_day += 1
-                    error_rows_all.append(
-                        {
-                            "date": target_date,
-                            "cik": filing.cik,
-                            "form_type": filing.form_type,
-                            "filename": filing.filename,
-                            "http_status": http_status,
-                            "error": err_str,
-                        }
-                    )
-
-                if skipped_due_to_size:
-                    scan_skipped_due_to_size_day += 1
-                elif ok and content_bytes is not None:
-                    scan_scanned_day += 1
-
-                ticker_val = item.get("ticker", "")
-
-                matched_allowed_all.append(
-                    {
-                        "date": target_date,
-                        "cik": filing.cik,
-                        "ticker": ticker_val,
-                        "company": filing.company,
-                        "form_type": filing.form_type,
-                        "date_filed": filing.date_filed,
-                        "filename": filing.filename,
-                        "index_url": filing.index_url,
-                        "fetch_ok": ok,
-                        "http_status": http_status,
-                        "bytes": bytes_len,
-                        "skipped_due_to_size": skipped_due_to_size,
-                        "labels": labels,
-                        "matched_terms": matched_terms,
-                        "error": err_str,
-                    }
-                )
-
-                if labels:
-                    matched_rows_day += 1
-                    if not ticker_val:
-                        blank_ticker_day += 1
-
-                    for lab in labels:
-                        label_counts_day[lab] = label_counts_day.get(lab, 0) + 1
-                        label_counts_total[lab] = label_counts_total.get(lab, 0) + 1
-
-                    free_float_shares = ""
-                    cached = float_cache.get(ticker_val)
-                    if isinstance(cached, dict):
-                        fs = _safe_int(cached.get("float_shares"))
-                        if fs is not None:
-                            free_float_shares = str(fs)
-
-                    row = {
-                        "date": target_date,
-                        "ticker": ticker_val,
-                        "cik": filing.cik,
-                        "company": filing.company,
-                        "form_type": filing.form_type,
-                        "accession": accession_from_filename(filing.filename),
-                        "filing_url": filing.index_url,
-                        "free_float_shares": free_float_shares,
-                        "labels": "|".join(labels),
-                        "matched_terms": "|".join(matched_terms),
-                    }
-
-                    line = ",".join([csv_escape(row.get(col, "")) for col in VERBOSE_COLUMNS]) + "\n"
-                    verbose_rows_all.append(line)
-
-                    if ticker_val:
-                        run_tickers_all.append(ticker_val)
-
-            day_info["counts"]["matched_rows"] = matched_rows_day
-            day_info["counts"]["blank_ticker_rows"] = blank_ticker_day
-            day_info["counts"]["scan_fetch_fail"] = scan_fetch_fail_day
-            day_info["counts"]["scan_skipped_due_to_size"] = scan_skipped_due_to_size_day
-            day_info["counts"]["scan_scanned"] = scan_scanned_day
-            day_info["label_counts"] = {k: label_counts_day[k] for k in sorted(label_counts_day.keys())}
-
-            audit_event(
-                audit,
-                "scan_complete_day",
-                {
-                    "date": target_date,
-                    "matched_rows": matched_rows_day,
-                    "blank_ticker_rows": blank_ticker_day,
-                    "fetch_fail": scan_fetch_fail_day,
-                    "skipped_due_to_size": scan_skipped_due_to_size_day,
-                    "scanned": scan_scanned_day,
-                    "float_gate_skipped_rows": float_gate_skipped,
-                    "allowed_rows_after_float_gate": len(allowed_filings),
-                },
-            )
-
-            audit["by_date"].append(day_info)
-            audit_event(audit, "day_end", {"date": target_date, "ok": True})
-
-            total_parsed_rows += parsed_row_count
-            total_allowed_rows += allowed_row_count
-            total_matched_rows += matched_rows_day
-            total_blank_ticker_rows += blank_ticker_day
-            total_scan_fetch_fail += scan_fetch_fail_day
-            total_scan_skipped_due_to_size += scan_skipped_due_to_size_day
-            total_scan_scanned += scan_scanned_day
-
-        except Exception as e:
-            day_info["master_idx"]["ok"] = False
-            day_info["master_idx"]["error"] = str(e)
-            audit_event(audit, "day_error", {"date": target_date, "error": str(e)})
-            audit["by_date"].append(day_info)
-            audit_event(audit, "day_end", {"date": target_date, "ok": False, "error": str(e)})
+    # filter matched rows to float gate pass
+    pass_set = set(pass_tickers)
+    matched_allowed_pass = []
+    for r in matched_allowed_all:
+        t = str(r.get("ticker") or "").strip().upper()
+        if not t:
             continue
+        if t in pass_set:
+            matched_allowed_pass.append(r)
 
-    # -----------------------------
-    # WRITE RANGE OUTPUTS
-    # -----------------------------
+    # 4) Write daily outputs
+    verbose_rows = [_normalize_matched_row(r) for r in matched_allowed_pass]
+    summary_rows = [_normalize_summary_row(r) for r in matched_allowed_pass]
+
+    # deterministic order for verbose and summary (date, ticker, form_type, filename)
+    verbose_rows = sorted(verbose_rows, key=lambda x: (x.get("date", ""), x.get("ticker", ""), x.get("form_type", ""), x.get("filename", "")))
+    summary_rows = sorted(summary_rows, key=lambda x: (x.get("date", ""), x.get("ticker", ""), x.get("index_url", "")))
+
+    _write_csv_dicts(f"{OUTPUT_DIR}/dilution_tickers_verbose.csv", VERBOSE_COLUMNS, verbose_rows)
+    _write_csv_dicts(f"{OUTPUT_DIR}/dilution_tickers.csv", SUMMARY_COLUMNS, summary_rows)
+
+    # 5) Persistent ticker master update (locked behavior)
+    existing_master = _read_master_verbose_repo_root()
+    merged_master = _merge_master_verbose(existing=existing_master, new_matches=matched_allowed_pass, end_date_iso=end_date)
+    _write_master_verbose_output(merged_master)
+    _write_master_summary_output(merged_master)
+
+    # 6) Label summary outputs (existing behavior)
+    label_counts = {}
+    for r in matched_allowed_pass:
+        for lab in (r.get("labels") or []):
+            label_counts[lab] = label_counts.get(lab, 0) + 1
+
+    label_summary = []
+    for lab in sorted(label_counts.keys()):
+        label_summary.append({"label": lab, "count": int(label_counts[lab])})
+
+    write_file_text(f"{OUTPUT_DIR}/label_summary.json", _json_dump_stable(label_summary))
+    _write_csv_dicts(f"{OUTPUT_DIR}/label_summary.csv", ["label", "count"], label_summary)
+
+    # 7) Raw intermediate dumps
     write_file_text(f"{OUTPUT_DIR}/allowed_filings.json", json.dumps(allowed_filings_all, indent=2))
     write_file_text(f"{OUTPUT_DIR}/matched_allowed_filings.json", json.dumps(matched_allowed_all, indent=2))
 
-    # v1.1.x additive: write severity output
-    build_dilution_severity_by_ticker(matched_allowed_all=matched_allowed_all, end_date_iso=end_date)
+    # v1.1.2 additive: update persistent severity events master + recompute severity from master
+    events_master = update_severity_events_master(matched_allowed_all=matched_allowed_all, end_date_iso=end_date, audit=audit)
+    build_dilution_severity_by_ticker_from_events(events_all=events_master, end_date_iso=end_date)
 
     # v1.1.1 additive: write avoid tickers output (derived from severity output)
     write_avoid_tickers_csv()
 
-    verbose_header = ",".join(VERBOSE_COLUMNS) + "\n"
-    write_file_text(f"{OUTPUT_DIR}/dilution_tickers_verbose.csv", verbose_header + "".join(verbose_rows_all))
+    # 8) Audit + metadata outputs
+    write_file_text(f"{OUTPUT_DIR}/audit_log.json", _json_dump_stable(audit))
 
-    write_ticker_list(f"{OUTPUT_DIR}/dilution_tickers.csv", run_tickers_all)
-
-    # -----------------------------
-    # PERSISTENT MASTER (VERBOSE) + STALE PRUNE
-    # Source of truth: dilution_tickers_all_verbose.csv (repo root)
-    # Derived: dilution_tickers_all.csv (ticker-only, pruned)
-    # -----------------------------
-    # Load existing verbose master from repo root if present; else from output; else empty
-    prior_verbose = {}
-    if os.path.exists(ALL_VERBOSE_ROOT):
-        prior_verbose = _parse_all_verbose_csv(ALL_VERBOSE_ROOT)
-        prior_source = "repo_root"
-    elif os.path.exists(ALL_VERBOSE_OUT):
-        prior_verbose = _parse_all_verbose_csv(ALL_VERBOSE_OUT)
-        prior_source = "output"
-    else:
-        prior_verbose = {}
-        prior_source = "none"
-
-    # Build run-level per-ticker updates from matched_allowed_all (deterministic)
-    # We only consider rows with labels and non-empty ticker (strict policy ensures this)
-    run_updates = {}  # ticker -> {last_seen_date, last_labels, last_filing_url, seen_increment}
-    for r in matched_allowed_all:
-        labels = r.get("labels") or []
-        tkr = str(r.get("ticker") or "").strip().upper()
-        filing_date = str(r.get("date") or "").strip()
-        filing_url = str(r.get("index_url") or "").strip()
-        if not tkr or not labels:
-            continue
-        lab_str = "|".join(labels)
-
-        u = run_updates.get(tkr)
-        if u is None:
-            run_updates[tkr] = {
-                "last_seen_date": filing_date,
-                "last_labels": lab_str,
-                "last_filing_url": filing_url,
-                "seen_increment": 1,
-            }
-        else:
-            # last_seen_date = max date (ISO sortable)
-            if filing_date and filing_date > u["last_seen_date"]:
-                u["last_seen_date"] = filing_date
-                u["last_labels"] = lab_str
-                u["last_filing_url"] = filing_url
-            u["seen_increment"] += 1
-
-    # Merge into master
-    merged = dict(prior_verbose)
-    for tkr in sorted(run_updates.keys()):
-        upd = run_updates[tkr]
-        existing = merged.get(tkr)
-        if existing is None:
-            merged[tkr] = {
-                "ticker": tkr,
-                "first_seen_date": upd["last_seen_date"],
-                "last_seen_date": upd["last_seen_date"],
-                "seen_count": str(upd["seen_increment"]),
-                "last_labels": upd["last_labels"],
-                "last_filing_url": upd["last_filing_url"],
-            }
-        else:
-            first_seen = existing.get("first_seen_date", "") or upd["last_seen_date"]
-            last_seen = existing.get("last_seen_date", "")
-            if not last_seen or upd["last_seen_date"] > last_seen:
-                last_seen = upd["last_seen_date"]
-                existing["last_labels"] = upd["last_labels"]
-                existing["last_filing_url"] = upd["last_filing_url"]
-
-            sc = _safe_int(existing.get("seen_count"))
-            if sc is None:
-                sc = 0
-            sc += int(upd["seen_increment"])
-            merged[tkr] = {
-                "ticker": tkr,
-                "first_seen_date": first_seen,
-                "last_seen_date": last_seen,
-                "seen_count": str(sc),
-                "last_labels": existing.get("last_labels", ""),
-                "last_filing_url": existing.get("last_filing_url", ""),
-            }
-
-    # Prune stale: last_seen_date < (END_DATE - STALE_DAYS)
-    end_obj = _date_to_obj(end_date)
-    cutoff_obj = (end_obj - timedelta(days=STALE_DAYS)) if end_obj else None
-    cutoff_iso = cutoff_obj.isoformat() if cutoff_obj else ""
-
-    before_count = len(merged)
-    removed = []
-    kept = {}
-
-    for tkr in sorted(merged.keys()):
-        rec = merged[tkr]
-        last_seen = rec.get("last_seen_date", "").strip()
-        last_obj = _date_to_obj(last_seen)
-        if cutoff_obj and last_obj and last_obj < cutoff_obj:
-            removed.append(tkr)
-        elif cutoff_obj and (not last_obj):
-            # deterministic: if last_seen_date is missing/unparseable, drop (strict hygiene)
-            removed.append(tkr)
-        else:
-            kept[tkr] = rec
-
-    after_count = len(kept)
-
-    # Write pruned verbose master to output
-    _write_all_verbose_csv(ALL_VERBOSE_OUT, kept)
-
-    # Derived pruned ticker-only list
-    active_tickers = sorted(kept.keys())
-    write_ticker_list(ALL_TICKERS_OUT, active_tickers)
-
-    audit["stale_prune"] = {
-        "stale_days": STALE_DAYS,
-        "end_date": end_date,
-        "cutoff_date_inclusive": cutoff_iso,
-        "prior_source": prior_source,
-        "prior_master_count": len(prior_verbose),
-        "merged_master_count": before_count,
-        "removed_stale_count": len(removed),
-        "active_master_count": after_count,
-    }
-
-    audit_event(
-        audit,
-        "all_tickers_master_updated",
-        {
-            "stale_days": STALE_DAYS,
-            "cutoff_date": cutoff_iso,
-            "prior_source": prior_source,
-            "prior_master_count": len(prior_verbose),
-            "merged_master_count": before_count,
-            "removed_stale_count": len(removed),
-            "active_master_count": after_count,
-        },
-    )
-
-    # -----------------------------
-    # LABEL SUMMARY + AUDIT
-    # -----------------------------
-    summary = {
-        "start_date": start_date,
-        "end_date": end_date,
-        "matched_rows": total_matched_rows,
-        "blank_ticker_rows": total_blank_ticker_rows,
-        "label_counts": {k: label_counts_total[k] for k in sorted(label_counts_total.keys())},
-        "float_gate": audit.get("float_gate", {}),
-        "stale_prune": audit.get("stale_prune", {}),
-    }
-    write_file_text(f"{OUTPUT_DIR}/label_summary.json", json.dumps(summary, indent=2))
-
-    summary_csv_lines = ["label,count\n"]
-    for k in sorted(label_counts_total.keys()):
-        summary_csv_lines.append(f"{csv_escape(k)},{label_counts_total[k]}\n")
-    write_file_text(f"{OUTPUT_DIR}/label_summary.csv", "".join(summary_csv_lines))
-
-    audit["counts"] = {
-        "parsed_rows": total_parsed_rows,
-        "allowed_rows": total_allowed_rows,
-        "matched_rows": total_matched_rows,
-        "blank_ticker_rows": total_blank_ticker_rows,
-        "scan_fetch_fail": total_scan_fetch_fail,
-        "scan_skipped_due_to_size": total_scan_skipped_due_to_size,
-        "scan_scanned": total_scan_scanned,
-    }
-
-    audit_event(
-        audit,
-        "range_scan_complete",
-        {
-            "start_date": start_date,
-            "end_date": end_date,
-            "days": dates,
-            "matched_rows": total_matched_rows,
-            "blank_ticker_rows": total_blank_ticker_rows,
-            "fetch_fail": total_scan_fetch_fail,
-            "skipped_due_to_size": total_scan_skipped_due_to_size,
-            "scanned": total_scan_scanned,
-            "float_gate": audit.get("float_gate", {}),
-            "stale_prune": audit.get("stale_prune", {}),
-        },
-    )
-
-    write_file_text(f"{OUTPUT_DIR}/audit_log.json", json.dumps(audit, indent=2))
-
-    # Sample fetch kept (unchanged)
-    os.makedirs(f"{OUTPUT_DIR}/filings_raw", exist_ok=True)
-    sample_n = 3
-    sample = []
-    seen_ciks = set()
-    for item in allowed_filings_all:
-        cik = item["cik"]
-        if cik in seen_ciks:
-            continue
-        seen_ciks.add(cik)
-        sample.append(item)
-        if len(sample) >= sample_n:
-            break
-
-    sample_results = []
-    for item in sample:
-        filing = FilingRef(
-            cik=item["cik"],
-            company=item["company"],
-            form_type=item["form_type"],
-            date_filed=item["date_filed"],
-            filename=item["filename"],
-            index_url=item["index_url"],
-        )
-
-        ok, content_bytes, err_str, http_status = fetch_primary_filing_text(filing=filing, user_agent=SEC_USER_AGENT)
-        out_name = filing_artifact_basename(filing)
-        out_path = f"{OUTPUT_DIR}/filings_raw/{out_name}"
-
-        bytes_len = (len(content_bytes) if content_bytes is not None else 0)
-        skipped_due_to_size = False
-        saved_path = None
-        labels = []
-        matched_terms = []
-
-        if ok and content_bytes is not None:
-            skipped_due_to_size = bytes_len > MAX_SAMPLE_BYTES
-            if not skipped_due_to_size:
-                write_file_bytes(out_path, content_bytes)
-                saved_path = out_path
-                filing_text = content_bytes.decode("utf-8", errors="replace")
-                labels, matched_terms = scan_filing_text_for_labels(filing_text)
-
-        sample_results.append(
-            {
-                "cik": filing.cik,
-                "company": filing.company,
-                "form_type": filing.form_type,
-                "date_filed": filing.date_filed,
-                "filename": filing.filename,
-                "index_url": filing.index_url,
-                "fetch_ok": ok,
-                "http_status": http_status,
-                "bytes": bytes_len,
-                "skipped_due_to_size": skipped_due_to_size,
-                "labels": labels,
-                "matched_terms": matched_terms,
-                "error": err_str,
-                "saved_path": (saved_path if saved_path else None),
-            }
-        )
-
-    write_file_text(f"{OUTPUT_DIR}/sample_filing_fetch.json", json.dumps(sample_results, indent=2))
-
-    run_meta = {
+    run_time = datetime.now(timezone.utc).isoformat()
+    run_metadata = {
         "system_version": SYSTEM_VERSION,
         "output_artifacts": [
             "allowed_filings.json",
@@ -1594,6 +1215,7 @@ def main():
             "sample_filing_fetch.json",
             "dilution_severity_by_ticker.csv",
             "avoid_tickers.csv",
+            "dilution_severity_events_all.csv",
         ],
         "run_timestamp_utc": run_time,
         "scan_start_date": start_date,
@@ -1601,18 +1223,9 @@ def main():
         "date_mode": date_mode,
         "scan_days": dates,
         "allowed_forms": ALLOWED_FORMS,
-        "sec_user_agent": SEC_USER_AGENT,
-        "float_gate": audit.get("float_gate", {}),
-        "stale_prune": audit.get("stale_prune", {}),
-        "range_totals": audit.get("counts", {}),
-        "status": "stale_prune_v1_all_verbose",
     }
-    write_file_text(f"{OUTPUT_DIR}/run_metadata.json", json.dumps(run_meta, indent=2))
 
-    print(f"Scan range: {start_date} .. {end_date} (days={len(dates)})")
-    print(f"Float gate: policy={FLOAT_GATE_POLICY}, max_shares={FLOAT_MAX_SHARES}")
-    sp = audit.get("stale_prune", {})
-    print(f"Stale prune: stale_days={STALE_DAYS}, cutoff={sp.get('cutoff_date_inclusive')}, active_master={sp.get('active_master_count')}, removed={sp.get('removed_stale_count')}")
+    write_file_text(f"{OUTPUT_DIR}/run_metadata.json", _json_dump_stable(run_metadata))
 
 
 if __name__ == "__main__":
