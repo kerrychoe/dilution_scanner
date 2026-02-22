@@ -1,316 +1,341 @@
-# Dilution Scanner
+# DilutionTicker Scanner
 
-## Version 1.1.0
+**Version:** `v1.1.2`
+**Git Tag:** `v1.1.2`
 
-Deterministic SEC EDGAR dilution scanner for U.S. small-cap traders.
-
----
-
-## 🎯 System Objective
-
-Identify U.S.-listed companies with explicit dilution-related SEC filings, filtered to:
-
-* Literal dilution language only (no inference, no LLM)
-* Share float ≤ 10,000,000 (Massive API)
-* Active within the last 180 days
-* Fully deterministic behavior
-* GitHub Actions automated daily runs
-
-Same inputs → Same outputs.
+Deterministic SEC filing scanner designed to identify U.S.-listed companies with explicit dilution-related activity and maintain a rolling severity model over a 180-day window.
 
 ---
 
-## 🧠 What This Scanner Detects
+# System Objective (Locked)
 
-The system scans SEC EDGAR daily master index files and identifies filings containing literal references to:
+Identify U.S.-listed companies with explicit dilution-related SEC filings using:
+
+* Literal substring matching only
+* No inference
+* No ML / LLM classification
+* Float ≤ 10,000,000 shares (Massive API)
+* Rolling 180-day window
+* Fully deterministic behavior (same inputs → same outputs)
+
+---
+
+# Architecture Overview
+
+## 1. Master Index Parsing
+
+For each scan date:
+
+* Fetch EDGAR `master.YYYYMMDD.idx`
+* Parse rows deterministically
+* Filter allowed forms:
+
+  * `424B*`
+  * `S-1`
+  * `S-3`
+  * `F-3`
+  * `8-K`
+
+No heuristics. Literal form matching only.
+
+---
+
+## 2. Float Gate (Locked Behavior)
+
+Strict float filter using Massive API:
+
+* Skip if no ticker
+* Skip if float unknown
+* Skip if float > 10M
+* 3 fixed retries
+* No concurrency
+* Deterministic ordering
+
+Artifacts:
+
+```
+output/float_gate_pass.csv
+output/float_gate_fail.csv
+output/float_gate_unknown.csv
+```
+
+---
+
+## 3. Literal Detection Rules (Locked)
+
+Detection labels (substring only):
 
 * `dilution_bank`
 * `pipe_financing`
 * `convert_financing`
 
-Rules are strict substring matches — no heuristics.
+No semantic interpretation.
 
 ---
 
-## ⚙️ Architecture Overview
+# Severity Model (v1.1.x)
 
-### 1️⃣ Multi-Day Deterministic Scan
+Severity is derived strictly from matched filings.
 
-For each date in:
+Rolling windows (inclusive of END_DATE):
 
-```
-
-START_DATE .. END_DATE
-
-```
-
-The system:
-
-1. Fetches that day’s `master.idx`
-2. Parses all filings
-3. Filters by allowed forms:
-
-   * 424B*
-   * S-1
-   * S-3
-   * F-3
-   * 8-K
-4. Applies float gate
-5. Fetches and scans filing text
-6. Aggregates matched rows
-
-Weekend and holiday handling is automatic (non-200 responses are logged and skipped).
+* 90-day
+* 180-day
 
 ---
 
-### 2️⃣ 10M Share Float Gate (Massive API)
-
-Only tickers with:
+## Label Weights (Locked)
 
 ```
-
-free_float_shares <= 10,000,000
-
-```
-
-are scanned.
-
-Configuration:
-
-* Deterministic call order
-* No parallelism
-* Fixed retries
-* Identity encoding
-* Strict policy: skip if no ticker or float unknown
-
-Massive API is authenticated via:
-
-```
-
-Authorization: Bearer <API_KEY>
-
-```
-
-Environment variables:
-
-```
-
-MASSIVE_FLOAT_URL_TEMPLATE
-MASSIVE_API_KEY
-
+dilution_bank      = 5
+pipe_financing     = 3
+convert_financing  = 3
 ```
 
 ---
 
-### 3️⃣ Persistent Master List (Self-Pruning)
+## Bank Tier Weights (Locked)
 
-The system maintains:
+Hardcoded tier mapping (1–5).
 
-```
-
-dilution_tickers_all_verbose.csv   (source of truth)
-dilution_tickers_all.csv           (derived ticker-only list)
+Bank multipliers:
 
 ```
+0: 100
+1: 105
+2: 110
+3: 120
+4: 135
+5: 150
+```
 
-Verbose master tracks per ticker:
+---
+
+## Filing Score Formula (Option C Multiplier)
+
+Per filing:
+
+```
+label_score = sum(unique label weights)
+bank_score  = max matched bank weight
+term_score  = sum term weights
+
+term_component = (term_score * BANK_MULTIPLIER[bank_score]) // 100
+final_filing_score = label_score + term_component + bank_score
+```
+
+Integer math only.
+
+---
+
+# Avoid Flag Logic (Locked)
+
+Thresholds:
+
+```
+BANK_BACKSTOP_MIN   = 4
+TERM_BACKSTOP_MIN   = 8
+FINAL_SEVERITY_MIN  = 20
+```
+
+Rule:
+
+```
+avoid_flag = 1 if:
+    (max_bank_score_180d >= 4 AND severity_score_90d >= 20)
+    OR
+    (term_score_90d >= 8)
+else 0
+```
+
+---
+
+# NEW in v1.1.2 — Persistent Severity Events Master
+
+## Problem Solved
+
+In v1.1.1, severity outputs were recomputed only from the current run.
+
+On quiet days:
+
+* `dilution_severity_by_ticker.csv` could become empty
+* `avoid_tickers.csv` could become empty
+
+This is now fixed.
+
+---
+
+## Severity Events Master (Source of Truth)
+
+New persistent file (repo root):
+
+```
+dilution_severity_events_all.csv
+```
+
+Each row represents one matched filing (“severity event”).
+
+### Stored Fields
 
 * ticker
-* first_seen_date
-* last_seen_date
-* seen_count
-* last_labels
-* last_filing_url
-
-On each run:
-
-* New matches update the master
-* Tickers with no dilution filings in the last **180 days** are automatically removed
-* Derived ticker-only file is regenerated
-
-This creates a rolling, self-cleaning dilution universe.
+* date
+* filing_url / filename
+* label_score
+* bank_score
+* term_score
+* final_filing_score
 
 ---
 
-## 🧠 v1.1.0 — Dilution Severity Intelligence (Additive)
+## Deterministic Event Handling
 
-v1.1.0 adds **deterministic severity scoring** per ticker, without changing:
+Each run:
 
-* detection rules
-* float gate
-* pruning behavior
-* determinism constraints
+1. Load prior events master (repo root)
+2. Append new matched events
+3. Deduplicate by stable key:
 
-### Severity output
+```
+event_key = ticker|date|filename
+```
 
-A new artifact ranks tickers by severity across two fixed windows:
+4. Prune events older than:
 
-* **90-day window**
-* **180-day window**
+```
+END_DATE - 179 days
+```
 
-The scoring is computed from **existing matched filing data only** (no additional API calls).
-
-### Deterministic scoring concept (high level)
-
-Each matched filing contributes a deterministic score derived from:
-
-* **Label weights** (fixed)
-* **Bank tier weights** (fixed mapping of literal bank-name terms)
-* **Toxic financing term weights** (fixed mapping of literal terms)
-* A **fixed bank multiplier** on term score (implemented deterministically)
-
-The per-filing scores are summed by ticker within each window and sorted deterministically.
+5. Recompute severity from the pruned master
 
 ---
 
-## 📁 Output Artifacts
+## Output Stability Guarantee
 
-Generated under `/output`:
+On days with zero new matches:
 
-| File                               | Description                          |
-| ---------------------------------- | ------------------------------------ |
-| `dilution_tickers_verbose.csv`     | Matched filings (per filing)         |
-| `dilution_tickers.csv`             | Unique tickers from current scan     |
-| `dilution_tickers_all_verbose.csv` | Persistent master with state         |
-| `dilution_tickers_all.csv`         | Active ticker-only list (≤180 days)  |
-| `float_gate_pass.csv`              | Tickers passing float gate           |
-| `float_gate_fail.csv`              | Tickers failing float gate           |
-| `float_gate_unknown.csv`           | Tickers without usable float         |
-| `label_summary.json`               | Aggregate label counts               |
-| `audit_log.json`                   | Full deterministic execution trace   |
-| `run_metadata.json`                | Run-level metadata including version |
-| `dilution_severity_by_ticker.csv`  | Severity ranking by ticker (90d/180d)|
+* Severity remains intact
+* Avoid universe remains intact
+* No wipe-out behavior
 
 ---
 
-## 📈 Severity Output Details (v1.1.0)
+# Output Files
 
-### `dilution_severity_by_ticker.csv` schema (stable order)
+Under `/output`:
 
-* `ticker`
-* `severity_score_90d`
-* `severity_score_180d`
-* `match_count_90d`
-* `match_count_180d`
-* `last_seen_date`
-* `last_labels`
-* `top_terms`
-* `top_banks`
-
-### Deterministic sort order
-
-1. `severity_score_90d` (desc)
-2. `severity_score_180d` (desc)
-3. `ticker` (asc)
+```
+dilution_tickers_verbose.csv
+dilution_tickers.csv
+dilution_tickers_all_verbose.csv
+dilution_tickers_all.csv
+dilution_severity_events_all.csv
+dilution_severity_by_ticker.csv
+avoid_tickers.csv
+float_gate_pass.csv
+float_gate_fail.csv
+float_gate_unknown.csv
+label_summary.json
+label_summary.csv
+audit_log.json
+run_metadata.json
+sample_filing_fetch.json
+```
 
 ---
 
-## 🔍 Determinism Guarantees
+## avoid_tickers.csv (v1.1.2)
 
-* No randomness
+* Contains only ticker symbols
+* No header row
+* Deterministically sorted
+* Empty file if no avoid flags
+
+Example:
+
+```
+ABC
+XYZ
+LMNO
+```
+
+---
+
+# Running the Scanner
+
+## Daily Mode (cron)
+
+If no START_DATE / END_DATE provided:
+
+* END_DATE = yesterday (UTC)
+* START_DATE = END_DATE
+
+---
+
+## Explicit Range
+
+```
+START_DATE=2026-02-10
+END_DATE=2026-02-14
+```
+
+GitHub Actions supports manual workflow_dispatch.
+
+---
+
+# Backfill Guidance
+
+To seed a full 180-day window:
+
+```
+START_DATE = END_DATE - 179 days
+END_DATE   = desired end date
+```
+
+Example:
+
+```
+START_DATE = 2025-08-25
+END_DATE   = 2026-02-20
+```
+
+---
+
+# Determinism Guarantees
+
+* Stable sorting everywhere
 * No concurrency
-* Stable sorting of all lists
-* Fixed retry strategy
-* Fixed form allowlist
-* Fixed float threshold
-* Literal string rules only
-* Stable CSV column order
-* Stable audit structure
-
-Every run is reproducible from identical inputs.
+* No randomness
+* No inference
+* No ML
+* No floating-point math
+* Integer scoring only
+* Same inputs → same outputs
 
 ---
 
-## 🚀 GitHub Actions Automation
+# Tech Stack
 
-The scanner runs:
-
-* Daily via cron
-* Manually via `workflow_dispatch`
-* Supports explicit date ranges
-
-Example backfill:
-
-```
-
-START_DATE = 2025-11-14
-END_DATE   = 2026-02-11
-
-```
-
-Secrets required:
-
-```
-
-MASSIVE_API_KEY
-
-```
+* Python 3.11
+* requests (only dependency)
+* GitHub Actions
+* Deterministic CSV + JSON artifacts
 
 ---
 
-## 📊 Current Trading Filters (v1.1.0)
+# Version History
 
-* Float ≤ 10,000,000 shares
-* Dilution-related filing language
-* Allowed SEC forms only
-* Active within 180 days
-* U.S.-listed tickers only
-* Deterministic severity ranking (90d + 180d)
+## v1.1.2
 
----
+* Added persistent severity events master
+* Fixed quiet-day severity wipe
+* Added deterministic dedupe logic
+* Added rolling 180-day event-level prune
+* Made avoid_tickers.csv headerless
+* Added SEC request throttle for stability
 
-## 🔒 Versioning
+## v1.1.1
 
-Current version: **1.1.0**
+* Rolling severity scoring
+* Avoid flag logic
+* Persistent ticker master with 180-day prune
 
-To create a new version tag:
-
-```
-
-git tag -a v1.1.0 -m "Version 1.1.0 – Severity Intelligence"
-git push origin v1.1.0
-
-```
-
-Each run writes:
-
-```
-
-"system_version": "1.1.0"
-
-```
-
-into `run_metadata.json`.
-
----
-
-## 🧩 Future Roadmap (Not in v1.1)
-
-* “Avoid watchlist” deterministic flags + thresholds (derived from severity components)
-* Lightspeed export formatting
-* Rule versioning system
-* Performance guardrails
-* Optional rolling-window mode
-* Additional deterministic summary outputs (e.g., top tickers by day/week)
-
----
-
-## ⚠️ Disclaimer
-
-This tool identifies filings containing dilution-related language.
-It does not provide investment advice.
-
----
-
-## 🏁 Status
-
-v1.1.0 represents a stable, production-ready deterministic dilution scanner with:
-
-* Multi-day scanning
-* 10M float filter
-* Persistent rolling master list
-* 180-day pruning
-* Full audit traceability
-* Automated daily execution
-* Deterministic severity ranking output (90d/180d)
-```
