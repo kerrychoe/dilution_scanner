@@ -1053,11 +1053,22 @@ def main():
     allowed_filings_all = []
     parsed_rows_total = 0
 
-    for d in dates:
-        parsed = parse_master_idx(d, user_agent=SEC_USER_AGENT)
-        parsed_rows_total += int(parsed.get("parsed_rows", 0))
-        allowed = parsed.get("allowed_filings") or []
-        allowed_filings_all.extend(allowed)
+from dilution_scanner.filings import sec_get  # add near imports if not already present
+
+for d in dates:
+    url = master_idx_url_for_date(d)
+
+    resp = sec_get(url, user_agent=SEC_USER_AGENT)
+    if resp.status_code != 200 or not resp.content:
+        continue
+
+    text = resp.content.decode("latin-1", errors="replace")
+    rows = parse_master_idx(text)  # <-- correct usage per master_idx_parser.py
+
+    parsed_rows_total += len(rows)
+
+    # build your allowed filings from `rows` (filter forms, map cik->ticker, etc.)
+    # (keep your existing deterministic sort keys)
 
     # deterministic ordering of allowed filings (date, cik, form_type, filename)
     def allowed_key(x):
