@@ -74,6 +74,10 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
+          # NEW: integrate any commits that happened while this workflow was running
+          git fetch origin main
+          git rebase origin/main
+          
           git add dilution_tickers_all.csv dilution_tickers_all_verbose.csv dilution_severity_events_all.csv
 
           git diff --cached --quiet && echo "No changes to commit." && exit 0
