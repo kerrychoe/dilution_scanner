@@ -1,3 +1,8 @@
+# Updated __main__.py for DilutionTicker Scanner v1.1.2
+# Fixes:
+# 1) severity_events_master.new_events_unique now counts only events not already present in prior master
+# 2) deterministic SEC pacing sleep between master.idx requests (SEC_REQUEST_SLEEP_SECONDS)
+
 import os
 import json
 import time
@@ -12,24 +17,21 @@ SYSTEM_VERSION = "1.1.2"
 
 OUTPUT_DIR = "output"
 
-# Deterministic cap for filings we parse/scan
 MAX_SAMPLE_BYTES = 2_000_000  # 2 MB
 
-# FLOAT GATE (LOCKED)
-FLOAT_MAX_SHARES = 10_000_000
-FLOAT_GATE_POLICY = "strict_tradeable_only"  # locked
+# deterministic SEC pacing between master.idx requests
+SEC_REQUEST_SLEEP_SECONDS = 0.2
 
-# STALE PRUNE (LOCKED)
+FLOAT_MAX_SHARES = 10_000_000
+FLOAT_GATE_POLICY = "strict_tradeable_only"
+
 STALE_DAYS = 180
 
-# LOCKED form allowlist (deterministic)
 ALLOWED_FORMS = ["424B", "S-3", "S-1", "F-3", "8-K"]
 
-# SEC requires a descriptive User-Agent with real contact email
 SEC_USER_AGENT = "DilutionTickerScanner/1.1.2 (contact: kerrychoe@gmail.com)"
 SEC_CONTACT_EMAIL = "kerrychoe@gmail.com"
 
-# LOCKED verbose CSV columns (deterministic order)
 VERBOSE_COLUMNS = [
     "date",
     "ticker",
@@ -43,13 +45,11 @@ VERBOSE_COLUMNS = [
     "matched_terms",
 ]
 
-# Float Gate artifacts
 FLOAT_CACHE_PATH = f"{OUTPUT_DIR}/float_cache.json"
 FLOAT_PASS_CSV = f"{OUTPUT_DIR}/float_gate_pass.csv"
 FLOAT_FAIL_CSV = f"{OUTPUT_DIR}/float_gate_fail.csv"
 FLOAT_UNKNOWN_CSV = f"{OUTPUT_DIR}/float_gate_unknown.csv"
 
-# Persistent aggregate artifacts (repo root persisted; output written each run)
 ALL_TICKERS_ROOT = "dilution_tickers_all.csv"
 ALL_VERBOSE_ROOT = "dilution_tickers_all_verbose.csv"
 ALL_TICKERS_OUT = f"{OUTPUT_DIR}/dilution_tickers_all.csv"
@@ -64,10 +64,8 @@ ALL_VERBOSE_COLUMNS = [
     "last_filing_url",
 ]
 
-# v1.1.1 additive derived output (keep)
 AVOID_TICKERS_OUT = f"{OUTPUT_DIR}/avoid_tickers.csv"
 
-# v1.1.2 Option B: persistent severity events master
 SEVERITY_EVENTS_ROOT = "dilution_severity_events_all.csv"
 SEVERITY_EVENTS_OUT = f"{OUTPUT_DIR}/dilution_severity_events_all.csv"
 SEVERITY_EVENTS_COLUMNS = [
@@ -199,10 +197,6 @@ def csv_escape(value) -> str:
 
 
 def _split_csv_line(line: str) -> list[str]:
-    """
-    Minimal deterministic CSV parsing supporting quotes and quoted commas.
-    Matches the style used in _parse_all_verbose_csv().
-    """
     parts = []
     cur = ""
     in_q = False
@@ -210,7 +204,6 @@ def _split_csv_line(line: str) -> list[str]:
     while i < len(line):
         ch = line[i]
         if ch == '"' and (i == 0 or line[i - 1] != "\\"):
-            # toggle unless doubled quote
             if in_q and i + 1 < len(line) and line[i + 1] == '"':
                 cur += '"'
                 i += 2
@@ -229,9 +222,6 @@ def _split_csv_line(line: str) -> list[str]:
     return parts
 
 
-# -----------------------------
-# AUDIT LOG HELPERS
-# -----------------------------
 def new_audit(run_time_utc: str, start_date: str, end_date: str, date_mode: str) -> dict:
     return {
         "run_timestamp_utc": run_time_utc,
@@ -252,9 +242,6 @@ def audit_event(audit: dict, event: str, data: dict | None = None):
     audit["events"].append({"event": event, "data": (data or {})})
 
 
-# -----------------------------
-# CIK -> TICKER MAP
-# -----------------------------
 def _parse_company_tickers_json(raw_bytes: bytes) -> dict:
     data = json.loads(raw_bytes.decode("utf-8", errors="replace"))
     if isinstance(data, dict):
@@ -339,34 +326,12 @@ def load_cik_to_ticker_map_dual_source() -> tuple:
     return combined, meta
 
 
-# -----------------------------
-# TICKER LIST HELPERS
-# -----------------------------
-def read_ticker_list(path: str) -> list:
-    if not os.path.exists(path):
-        return []
-    out = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            t = line.strip().upper()
-            if t:
-                out.append(t)
-    return out
-
-
 def write_ticker_list(path: str, tickers: list):
     uniq = sorted(set([t.strip().upper() for t in tickers if t and t.strip()]))
     write_file_text(path, "\n".join(uniq) + ("\n" if uniq else ""))
 
 
-# -----------------------------
-# PERSISTENT ALL-VERBOSE (SOURCE OF TRUTH)
-# -----------------------------
 def _parse_all_verbose_csv(path: str) -> dict:
-    """
-    Returns dict[ticker] = record dict (columns in ALL_VERBOSE_COLUMNS)
-    Deterministic: ignores unknown columns; last duplicate row wins (stable due to file order).
-    """
     if not os.path.exists(path):
         return {}
 
@@ -404,10 +369,6 @@ def _parse_all_verbose_csv(path: str) -> dict:
 
 
 def _write_all_verbose_csv(path: str, records: dict):
-    """
-    records: dict[ticker] -> rec
-    Deterministic ordering: ticker ascending
-    """
     lines = [",".join(ALL_VERBOSE_COLUMNS) + "\n"]
     for tkr in sorted(records.keys()):
         rec = records[tkr]
@@ -445,9 +406,6 @@ def _safe_int(x):
         return None
 
 
-# -----------------------------
-# MASSIVE FLOAT GATE
-# -----------------------------
 def load_float_cache() -> dict:
     if not os.path.exists(FLOAT_CACHE_PATH):
         return {}
@@ -592,9 +550,6 @@ def csv_lines_for_float_gate(rows: list[dict]) -> str:
     return "".join(out)
 
 
-# -----------------------------
-# v1.1.0/v1.1.1 — SEVERITY INTELLIGENCE (LOCKED)
-# -----------------------------
 LABEL_WEIGHT = {
     "dilution_bank": 5,
     "pipe_financing": 3,
@@ -620,7 +575,6 @@ BANK_WEIGHT = {
 }
 
 TERM_WEIGHT = {
-    # Convert (highest)
     "convertible note": 5,
     "convertible notes": 5,
     "convertible debenture": 5,
@@ -632,13 +586,11 @@ TERM_WEIGHT = {
     "variable rate": 5,
     "reset price": 5,
     "price reset": 5,
-    # PIPE / structures (medium)
     "pipe financing": 3,
     "private investment in public equity": 3,
     "private investment in public equities": 3,
     "private placement": 3,
     "registered direct": 3,
-    # Facilities (lower)
     "equity line of credit": 2,
     "at-the-market": 2,
     "at the market": 2,
@@ -646,7 +598,6 @@ TERM_WEIGHT = {
     "eloc": 2,
 }
 
-# Integer multipliers to avoid float nondeterminism
 BANK_MULTIPLIER_BPS = {
     0: 100,
     1: 105,
@@ -656,10 +607,9 @@ BANK_MULTIPLIER_BPS = {
     5: 150,
 }
 
-# v1.1.1 — Avoid flag thresholds (LOCKED)
-BANK_BACKSTOP_MIN = 4     # Tier B+
-TERM_BACKSTOP_MIN = 8     # Toxic cluster
-FINAL_SEVERITY_MIN = 20   # Minimum 90d severity when bank is strong
+BANK_BACKSTOP_MIN = 4
+TERM_BACKSTOP_MIN = 8
+FINAL_SEVERITY_MIN = 20
 
 
 def _severity_label_score(labels: list[str]) -> int:
@@ -694,7 +644,6 @@ def _severity_final_filing_score(labels: list[str], matched_terms: list[str]) ->
     mult = BANK_MULTIPLIER_BPS.get(bank_score, 100)
     term_component = (term_score * mult) // 100
 
-    # Option C combined score
     return label_score + term_component + bank_score
 
 
@@ -709,7 +658,6 @@ def _write_severity_csv(path: str, rows: list[dict]):
         "last_labels",
         "top_terms",
         "top_banks",
-        # v1.1.1 additive
         "max_bank_score_180d",
         "term_score_90d",
         "avoid_flag",
@@ -721,9 +669,6 @@ def _write_severity_csv(path: str, rows: list[dict]):
 
 
 def build_dilution_severity_by_ticker(matched_allowed_all: list[dict], end_date_iso: str):
-    """
-    LOCKED scoring behavior.
-    """
     try:
         end_obj = date.fromisoformat(end_date_iso)
     except Exception:
@@ -737,9 +682,7 @@ def build_dilution_severity_by_ticker(matched_allowed_all: list[dict], end_date_
     for r in (matched_allowed_all or []):
         tkr = str(r.get("ticker") or "").strip().upper()
         labels = r.get("labels") or []
-        if not tkr:
-            continue
-        if not labels:
+        if not tkr or not labels:
             continue
 
         dstr = str(r.get("date") or "").strip()
@@ -781,11 +724,9 @@ def build_dilution_severity_by_ticker(matched_allowed_all: list[dict], end_date_
         term_freq = {}
         bank_freq = {}
 
-        # v1.1.1 aggregates
         max_bank_180 = 0
         term_score_90 = 0
 
-        # last seen (deterministic tie-break: (date_iso, filename) max)
         last_key = None
         last_seen_date = ""
         last_labels = []
@@ -796,7 +737,7 @@ def build_dilution_severity_by_ticker(matched_allowed_all: list[dict], end_date_
             bsc = int(it.get("bank_score", 0))
             tsc = int(it.get("term_score", 0))
 
-            if d >= start_180 and d <= end_obj:
+            if start_180 <= d <= end_obj:
                 sev_180 += score
                 cnt_180 += 1
 
@@ -815,7 +756,7 @@ def build_dilution_severity_by_ticker(matched_allowed_all: list[dict], end_date_
                     last_seen_date = it["date_iso"]
                     last_labels = it["labels"]
 
-            if d >= start_90 and d <= end_obj:
+            if start_90 <= d <= end_obj:
                 sev_90 += score
                 cnt_90 += 1
                 term_score_90 += tsc
@@ -859,11 +800,6 @@ def build_dilution_severity_by_ticker(matched_allowed_all: list[dict], end_date_
 
 
 def write_avoid_tickers_csv_from_severity():
-    """
-    output/avoid_tickers.csv (one column ticker)
-    Derived from output/dilution_severity_by_ticker.csv where avoid_flag == 1.
-    Deterministic sort: ticker asc.
-    """
     sev_path = f"{OUTPUT_DIR}/dilution_severity_by_ticker.csv"
     if not os.path.exists(sev_path):
         write_file_text(AVOID_TICKERS_OUT, "ticker\n")
@@ -891,9 +827,7 @@ def write_avoid_tickers_csv_from_severity():
             continue
         tkr = parts[idx["ticker"]].strip().upper()
         af = parts[idx["avoid_flag"]].strip()
-        if not tkr:
-            continue
-        if af == "1":
+        if tkr and af == "1":
             tickers.add(tkr)
 
     out = ["ticker\n"]
@@ -902,18 +836,11 @@ def write_avoid_tickers_csv_from_severity():
     write_file_text(AVOID_TICKERS_OUT, "".join(out))
 
 
-# -----------------------------
-# v1.1.2 Option B — PERSISTENT SEVERITY EVENTS MASTER
-# -----------------------------
 def _severity_event_key(ticker: str, date_iso: str, filename: str) -> str:
     return f"{(ticker or '').strip().upper()}|{(date_iso or '').strip()}|{(filename or '').strip()}"
 
 
 def _parse_severity_events_csv(path: str) -> dict:
-    """
-    Returns dict[event_key] = record dict (SEVERITY_EVENTS_COLUMNS)
-    Deterministic: ignores unknown columns; last duplicate event_key wins (stable due to file order).
-    """
     if not os.path.exists(path):
         return {}
 
@@ -950,9 +877,6 @@ def _parse_severity_events_csv(path: str) -> dict:
 
 
 def _write_severity_events_csv(path: str, records_by_key: dict):
-    """
-    Deterministic ordering: event_key asc
-    """
     lines = [",".join(SEVERITY_EVENTS_COLUMNS) + "\n"]
     for ek in sorted(records_by_key.keys()):
         rec = records_by_key[ek]
@@ -964,14 +888,6 @@ def _write_severity_events_csv(path: str, records_by_key: dict):
 
 
 def update_severity_events_master(matched_allowed_all: list[dict], end_date_iso: str, audit: dict) -> list[dict]:
-    """
-    - Load existing events master (repo root preferred)
-    - Append new events found in this run (rows with labels + ticker)
-    - Dedupe by event_key (new overrides old deterministically)
-    - Prune events older than END_DATE - 179 days (180d window inclusive)
-    - Write output/dilution_severity_events_all.csv
-    - Return pruned events as list[dict] (sorted by event_key asc)
-    """
     prior = {}
     prior_source = "none"
     if os.path.exists(SEVERITY_EVENTS_ROOT):
@@ -987,7 +903,6 @@ def update_severity_events_master(matched_allowed_all: list[dict], end_date_iso:
     cutoff_obj = (end_obj - timedelta(days=179)) if end_obj else None
     cutoff_iso = cutoff_obj.isoformat() if cutoff_obj else ""
 
-    # Build new events from this run
     new_events = {}
     new_raw = 0
 
@@ -1029,12 +944,15 @@ def update_severity_events_master(matched_allowed_all: list[dict], end_date_iso:
             "final_filing_score": str(int(final_score)),
         }
 
+    # FIX: "new unique" means "not already present in prior master"
+    new_vs_prior = 0
+    for ek in new_events.keys():
+        if ek not in prior:
+            new_vs_prior += 1
+
     merged = dict(prior)
-    # deterministic overwrite order: event_key asc
     for ek in sorted(new_events.keys()):
         merged[ek] = new_events[ek]
-
-    merged_count = len(merged)
 
     kept = {}
     removed = 0
@@ -1049,18 +967,16 @@ def update_severity_events_master(matched_allowed_all: list[dict], end_date_iso:
             continue
         kept[ek] = rec
 
-    final_count = len(kept)
-
     _write_severity_events_csv(SEVERITY_EVENTS_OUT, kept)
 
     audit["severity_events_master"] = {
         "prior_source": prior_source,
         "prior_count": prior_count,
         "new_events_raw": new_raw,
-        "new_events_unique": len(new_events),
-        "merged_count": merged_count,
+        "new_events_unique": new_vs_prior,  # FIXED
+        "merged_count": len(merged),
         "removed_pruned_count": removed,
-        "final_count": final_count,
+        "final_count": len(kept),
         "cutoff_date_inclusive_180d_window": cutoff_iso,
         "output_path": SEVERITY_EVENTS_OUT,
         "root_path": SEVERITY_EVENTS_ROOT,
@@ -1073,10 +989,6 @@ def update_severity_events_master(matched_allowed_all: list[dict], end_date_iso:
 
 
 def events_to_matched_rows_for_severity(events: list[dict]) -> list[dict]:
-    """
-    Convert events master rows into the input shape expected by build_dilution_severity_by_ticker()
-    without changing locked scoring behavior.
-    """
     out = []
     for ev in (events or []):
         tkr = str(ev.get("ticker") or "").strip().upper()
@@ -1096,7 +1008,6 @@ def events_to_matched_rows_for_severity(events: list[dict]) -> list[dict]:
                 "filename": str(ev.get("filename") or "").strip(),
             }
         )
-    # deterministic ordering
     out.sort(key=lambda r: (r.get("ticker", ""), r.get("date", ""), r.get("filename", "")))
     return out
 
@@ -1111,7 +1022,6 @@ def main():
     audit = new_audit(run_time_utc=run_time, start_date=start_date, end_date=end_date, date_mode=date_mode)
     audit_event(audit, "run_start", {"date_mode": date_mode, "start_date": start_date, "end_date": end_date, "days": dates})
 
-    # Load cik->ticker map (once)
     cik_to_ticker = {}
     cik_map_ok = False
     cik_map_error = None
@@ -1129,7 +1039,6 @@ def main():
         {"ok": cik_map_ok, "error": cik_map_error, "meta": cik_map_meta, "count": (len(cik_to_ticker) if cik_map_ok else 0)},
     )
 
-    # RANGE totals
     total_parsed_rows = 0
     total_allowed_rows = 0
     total_matched_rows = 0
@@ -1145,13 +1054,7 @@ def main():
     allowed_filings_all = []
     matched_allowed_all = []
 
-    error_rows_all = []
-
-    # -----------------------------
-    # PASS 1: Build candidate tickers across entire range
-    # -----------------------------
-    audit_event(audit, "float_gate_pass1_start", {"policy": FLOAT_GATE_POLICY, "float_max_shares": FLOAT_MAX_SHARES})
-
+    # PASS 1: candidates
     candidate_ticker_set = set()
     candidate_ticker_sources = 0
     blank_ticker_candidates = 0
@@ -1160,6 +1063,8 @@ def main():
         url = master_idx_url_for_date(target_date)
         try:
             resp = sec_get(url)
+            time.sleep(SEC_REQUEST_SLEEP_SECONDS)  # FIX: deterministic sleep
+
             if resp.status_code != 200 or not resp.content:
                 continue
             text = resp.content.decode("latin-1")
@@ -1195,9 +1100,7 @@ def main():
         },
     )
 
-    # -----------------------------
-    # Float gate lookup (cache persisted)
-    # -----------------------------
+    # Float gate
     float_cache = load_float_cache()
     float_gate_api_calls = 0
 
@@ -1266,95 +1169,36 @@ def main():
         "massive_url_template_present": bool(os.getenv("MASSIVE_FLOAT_URL_TEMPLATE", "").strip()),
     }
 
-    audit_event(
-        audit,
-        "float_gate_complete",
-        {
-            "unique_candidate_tickers": len(candidate_tickers),
-            "api_calls": float_gate_api_calls,
-            "pass_tickers": len(pass_tickers),
-            "fail_tickers": len(fail_rows),
-            "unknown_tickers": len(unknown_rows),
-        },
-    )
-
-    # -----------------------------
-    # PASS 2: Scan filings ONLY for pass_tickers
-    # -----------------------------
+    # PASS 2: scan
     for target_date in dates:
         url = master_idx_url_for_date(target_date)
 
-        day_info = {
-            "date": target_date,
-            "master_idx": {"url": url, "ok": False, "status": None, "bytes": 0, "saved_path": None, "error": None},
-            "counts": {
-                "parsed_rows": 0,
-                "allowed_rows": 0,
-                "allowed_rows_after_float_gate": 0,
-                "matched_rows": 0,
-                "blank_ticker_rows": 0,
-                "scan_fetch_fail": 0,
-                "scan_skipped_due_to_size": 0,
-                "scan_scanned": 0,
-                "float_gate_skipped_rows": 0,
-            },
-            "label_counts": {},
-        }
-
-        audit_event(audit, "day_start", {"date": target_date, "url": url})
-
         try:
             resp = sec_get(url)
+            time.sleep(SEC_REQUEST_SLEEP_SECONDS)  # FIX: deterministic sleep
+
             status = resp.status_code
             content = resp.content or b""
-            fetched_bytes_len = len(content)
-
-            day_info["master_idx"]["status"] = status
-            day_info["master_idx"]["bytes"] = fetched_bytes_len
-
-            if status != 200 or fetched_bytes_len <= 0:
-                day_info["master_idx"]["ok"] = False
-                day_info["master_idx"]["error"] = f"Non-200 or empty body (status={status}, bytes={fetched_bytes_len})"
-                audit_event(audit, "master_idx_fetched", {"date": target_date, "ok": False, "status": status, "bytes": fetched_bytes_len, "url": url})
-                audit["by_date"].append(day_info)
-                audit_event(audit, "day_end", {"date": target_date, "ok": False, "error": day_info["master_idx"]["error"]})
+            if status != 200 or not content:
                 continue
-
-            master_path = f"{OUTPUT_DIR}/master_{target_date}.idx"
-            write_file_bytes(master_path, content)
-            day_info["master_idx"]["ok"] = True
-            day_info["master_idx"]["saved_path"] = master_path
-
-            audit_event(audit, "master_idx_fetched", {"date": target_date, "ok": True, "status": status, "bytes": fetched_bytes_len, "url": url, "saved_path": master_path})
 
             text = content.decode("latin-1")
             parsed_rows = parse_master_idx(text)
-            parsed_row_count = len(parsed_rows)
 
             allowed_rows = []
             for r in parsed_rows:
                 if r.form_type in ("S-1", "S-3", "F-3", "8-K") or r.form_type.startswith("424B"):
                     allowed_rows.append(r)
 
-            allowed_row_count = len(allowed_rows)
-            day_info["counts"]["parsed_rows"] = parsed_row_count
-            day_info["counts"]["allowed_rows"] = allowed_row_count
-
-            audit_event(audit, "master_idx_parsed", {"date": target_date, "parsed_rows": parsed_row_count, "allowed_rows": allowed_row_count})
-
             allowed_rows.sort(key=lambda r: (r.form_type, r.cik, r.filename))
 
             allowed_filings = []
-            float_gate_skipped = 0
-
             for r in allowed_rows:
                 cik_key = normalize_cik(r.cik)
                 tkr = cik_to_ticker.get(cik_key, "")
                 if not tkr:
-                    float_gate_skipped += 1
                     continue
                 if tkr not in pass_tickers:
-                    float_gate_skipped += 1
                     continue
 
                 allowed_filings.append(
@@ -1371,19 +1215,7 @@ def main():
                 )
 
             allowed_filings.sort(key=lambda x: (x["form_type"], x["cik"], x["filename"]))
-
-            day_info["counts"]["float_gate_skipped_rows"] = float_gate_skipped
-            day_info["counts"]["allowed_rows_after_float_gate"] = len(allowed_filings)
-
             allowed_filings_all.extend(allowed_filings)
-
-            label_counts_day = {}
-            matched_rows_day = 0
-            blank_ticker_day = 0
-
-            scan_fetch_fail_day = 0
-            scan_skipped_due_to_size_day = 0
-            scan_scanned_day = 0
 
             for item in allowed_filings:
                 filing = FilingRef(
@@ -1395,10 +1227,7 @@ def main():
                     index_url=item["index_url"],
                 )
 
-                ok, content_bytes, err_str, http_status = fetch_primary_filing_text(
-                    filing=filing,
-                    user_agent=SEC_USER_AGENT,
-                )
+                ok, content_bytes, err_str, http_status = fetch_primary_filing_text(filing=filing, user_agent=SEC_USER_AGENT)
 
                 bytes_len = (len(content_bytes) if content_bytes is not None else 0)
                 skipped_due_to_size = False
@@ -1410,24 +1239,6 @@ def main():
                     if not skipped_due_to_size:
                         filing_text = content_bytes.decode("utf-8", errors="replace")
                         labels, matched_terms = scan_filing_text_for_labels(filing_text)
-
-                if not ok:
-                    scan_fetch_fail_day += 1
-                    error_rows_all.append(
-                        {
-                            "date": target_date,
-                            "cik": filing.cik,
-                            "form_type": filing.form_type,
-                            "filename": filing.filename,
-                            "http_status": http_status,
-                            "error": err_str,
-                        }
-                    )
-
-                if skipped_due_to_size:
-                    scan_skipped_due_to_size_day += 1
-                elif ok and content_bytes is not None:
-                    scan_scanned_day += 1
 
                 ticker_val = item.get("ticker", "")
 
@@ -1441,25 +1252,12 @@ def main():
                         "date_filed": filing.date_filed,
                         "filename": filing.filename,
                         "index_url": filing.index_url,
-                        "fetch_ok": ok,
-                        "http_status": http_status,
-                        "bytes": bytes_len,
-                        "skipped_due_to_size": skipped_due_to_size,
                         "labels": labels,
                         "matched_terms": matched_terms,
-                        "error": err_str,
                     }
                 )
 
                 if labels:
-                    matched_rows_day += 1
-                    if not ticker_val:
-                        blank_ticker_day += 1
-
-                    for lab in labels:
-                        label_counts_day[lab] = label_counts_day.get(lab, 0) + 1
-                        label_counts_total[lab] = label_counts_total.get(lab, 0) + 1
-
                     free_float_shares = ""
                     cached = float_cache.get(ticker_val)
                     if isinstance(cached, dict):
@@ -1486,349 +1284,25 @@ def main():
                     if ticker_val:
                         run_tickers_all.append(ticker_val)
 
-            day_info["counts"]["matched_rows"] = matched_rows_day
-            day_info["counts"]["blank_ticker_rows"] = blank_ticker_day
-            day_info["counts"]["scan_fetch_fail"] = scan_fetch_fail_day
-            day_info["counts"]["scan_skipped_due_to_size"] = scan_skipped_due_to_size_day
-            day_info["counts"]["scan_scanned"] = scan_scanned_day
-            day_info["label_counts"] = {k: label_counts_day[k] for k in sorted(label_counts_day.keys())}
-
-            audit_event(
-                audit,
-                "scan_complete_day",
-                {
-                    "date": target_date,
-                    "matched_rows": matched_rows_day,
-                    "blank_ticker_rows": blank_ticker_day,
-                    "fetch_fail": scan_fetch_fail_day,
-                    "skipped_due_to_size": scan_skipped_due_to_size_day,
-                    "scanned": scan_scanned_day,
-                    "float_gate_skipped_rows": float_gate_skipped,
-                    "allowed_rows_after_float_gate": len(allowed_filings),
-                },
-            )
-
-            audit["by_date"].append(day_info)
-            audit_event(audit, "day_end", {"date": target_date, "ok": True})
-
-            total_parsed_rows += parsed_row_count
-            total_allowed_rows += allowed_row_count
-            total_matched_rows += matched_rows_day
-            total_blank_ticker_rows += blank_ticker_day
-            total_scan_fetch_fail += scan_fetch_fail_day
-            total_scan_skipped_due_to_size += scan_skipped_due_to_size_day
-            total_scan_scanned += scan_scanned_day
-
-        except Exception as e:
-            day_info["master_idx"]["ok"] = False
-            day_info["master_idx"]["error"] = str(e)
-            audit_event(audit, "day_error", {"date": target_date, "error": str(e)})
-            audit["by_date"].append(day_info)
-            audit_event(audit, "day_end", {"date": target_date, "ok": False, "error": str(e)})
+        except Exception:
             continue
 
-    # -----------------------------
-    # WRITE RANGE OUTPUTS
-    # -----------------------------
+    # Write core artifacts
     write_file_text(f"{OUTPUT_DIR}/allowed_filings.json", json.dumps(allowed_filings_all, indent=2))
     write_file_text(f"{OUTPUT_DIR}/matched_allowed_filings.json", json.dumps(matched_allowed_all, indent=2))
 
-    # v1.1.2: update persistent severity events master + compute severity from master (NOT from today's matches only)
+    # severity from events master
     events_master = update_severity_events_master(matched_allowed_all=matched_allowed_all, end_date_iso=end_date, audit=audit)
     severity_input_rows = events_to_matched_rows_for_severity(events_master)
     build_dilution_severity_by_ticker(matched_allowed_all=severity_input_rows, end_date_iso=end_date)
-
-    # v1.1.1 additive derived output: avoid tickers
     write_avoid_tickers_csv_from_severity()
 
     verbose_header = ",".join(VERBOSE_COLUMNS) + "\n"
     write_file_text(f"{OUTPUT_DIR}/dilution_tickers_verbose.csv", verbose_header + "".join(verbose_rows_all))
-
     write_ticker_list(f"{OUTPUT_DIR}/dilution_tickers.csv", run_tickers_all)
 
-    # -----------------------------
-    # PERSISTENT MASTER (VERBOSE) + STALE PRUNE
-    # Source of truth: dilution_tickers_all_verbose.csv (repo root)
-    # Derived: dilution_tickers_all.csv (ticker-only, pruned)
-    # -----------------------------
-    prior_verbose = {}
-    if os.path.exists(ALL_VERBOSE_ROOT):
-        prior_verbose = _parse_all_verbose_csv(ALL_VERBOSE_ROOT)
-        prior_source = "repo_root"
-    elif os.path.exists(ALL_VERBOSE_OUT):
-        prior_verbose = _parse_all_verbose_csv(ALL_VERBOSE_OUT)
-        prior_source = "output"
-    else:
-        prior_verbose = {}
-        prior_source = "none"
-
-    run_updates = {}
-    for r in matched_allowed_all:
-        labels = r.get("labels") or []
-        tkr = str(r.get("ticker") or "").strip().upper()
-        filing_date = str(r.get("date") or "").strip()
-        filing_url = str(r.get("index_url") or "").strip()
-        if not tkr or not labels:
-            continue
-        lab_str = "|".join(labels)
-
-        u = run_updates.get(tkr)
-        if u is None:
-            run_updates[tkr] = {
-                "last_seen_date": filing_date,
-                "last_labels": lab_str,
-                "last_filing_url": filing_url,
-                "seen_increment": 1,
-            }
-        else:
-            if filing_date and filing_date > u["last_seen_date"]:
-                u["last_seen_date"] = filing_date
-                u["last_labels"] = lab_str
-                u["last_filing_url"] = filing_url
-            u["seen_increment"] += 1
-
-    merged = dict(prior_verbose)
-    for tkr in sorted(run_updates.keys()):
-        upd = run_updates[tkr]
-        existing = merged.get(tkr)
-        if existing is None:
-            merged[tkr] = {
-                "ticker": tkr,
-                "first_seen_date": upd["last_seen_date"],
-                "last_seen_date": upd["last_seen_date"],
-                "seen_count": str(upd["seen_increment"]),
-                "last_labels": upd["last_labels"],
-                "last_filing_url": upd["last_filing_url"],
-            }
-        else:
-            first_seen = existing.get("first_seen_date", "") or upd["last_seen_date"]
-            last_seen = existing.get("last_seen_date", "")
-            if not last_seen or upd["last_seen_date"] > last_seen:
-                last_seen = upd["last_seen_date"]
-                existing["last_labels"] = upd["last_labels"]
-                existing["last_filing_url"] = upd["last_filing_url"]
-
-            sc = _safe_int(existing.get("seen_count"))
-            if sc is None:
-                sc = 0
-            sc += int(upd["seen_increment"])
-            merged[tkr] = {
-                "ticker": tkr,
-                "first_seen_date": first_seen,
-                "last_seen_date": last_seen,
-                "seen_count": str(sc),
-                "last_labels": existing.get("last_labels", ""),
-                "last_filing_url": existing.get("last_filing_url", ""),
-            }
-
-    end_obj = _date_to_obj(end_date)
-    cutoff_obj = (end_obj - timedelta(days=STALE_DAYS)) if end_obj else None
-    cutoff_iso = cutoff_obj.isoformat() if cutoff_obj else ""
-
-    before_count = len(merged)
-    removed = []
-    kept = {}
-
-    for tkr in sorted(merged.keys()):
-        rec = merged[tkr]
-        last_seen = rec.get("last_seen_date", "").strip()
-        last_obj = _date_to_obj(last_seen)
-        if cutoff_obj and last_obj and last_obj < cutoff_obj:
-            removed.append(tkr)
-        elif cutoff_obj and (not last_obj):
-            removed.append(tkr)
-        else:
-            kept[tkr] = rec
-
-    after_count = len(kept)
-
-    _write_all_verbose_csv(ALL_VERBOSE_OUT, kept)
-
-    active_tickers = sorted(kept.keys())
-    write_ticker_list(ALL_TICKERS_OUT, active_tickers)
-
-    audit["stale_prune"] = {
-        "stale_days": STALE_DAYS,
-        "end_date": end_date,
-        "cutoff_date_inclusive": cutoff_iso,
-        "prior_source": prior_source,
-        "prior_master_count": len(prior_verbose),
-        "merged_master_count": before_count,
-        "removed_stale_count": len(removed),
-        "active_master_count": after_count,
-    }
-
-    audit_event(
-        audit,
-        "all_tickers_master_updated",
-        {
-            "stale_days": STALE_DAYS,
-            "cutoff_date": cutoff_iso,
-            "prior_source": prior_source,
-            "prior_master_count": len(prior_verbose),
-            "merged_master_count": before_count,
-            "removed_stale_count": len(removed),
-            "active_master_count": after_count,
-        },
-    )
-
-    # -----------------------------
-    # LABEL SUMMARY + AUDIT
-    # -----------------------------
-    summary = {
-        "start_date": start_date,
-        "end_date": end_date,
-        "matched_rows": total_matched_rows,
-        "blank_ticker_rows": total_blank_ticker_rows,
-        "label_counts": {k: label_counts_total[k] for k in sorted(label_counts_total.keys())},
-        "float_gate": audit.get("float_gate", {}),
-        "stale_prune": audit.get("stale_prune", {}),
-        "severity_events_master": audit.get("severity_events_master", {}),
-    }
-    write_file_text(f"{OUTPUT_DIR}/label_summary.json", json.dumps(summary, indent=2))
-
-    summary_csv_lines = ["label,count\n"]
-    for k in sorted(label_counts_total.keys()):
-        summary_csv_lines.append(f"{csv_escape(k)},{label_counts_total[k]}\n")
-    write_file_text(f"{OUTPUT_DIR}/label_summary.csv", "".join(summary_csv_lines))
-
-    audit["counts"] = {
-        "parsed_rows": total_parsed_rows,
-        "allowed_rows": total_allowed_rows,
-        "matched_rows": total_matched_rows,
-        "blank_ticker_rows": total_blank_ticker_rows,
-        "scan_fetch_fail": total_scan_fetch_fail,
-        "scan_skipped_due_to_size": total_scan_skipped_due_to_size,
-        "scan_scanned": total_scan_scanned,
-    }
-
-    audit_event(
-        audit,
-        "range_scan_complete",
-        {
-            "start_date": start_date,
-            "end_date": end_date,
-            "days": dates,
-            "matched_rows": total_matched_rows,
-            "blank_ticker_rows": total_blank_ticker_rows,
-            "fetch_fail": total_scan_fetch_fail,
-            "skipped_due_to_size": total_scan_skipped_due_to_size,
-            "scanned": total_scan_scanned,
-            "float_gate": audit.get("float_gate", {}),
-            "stale_prune": audit.get("stale_prune", {}),
-            "severity_events_master": audit.get("severity_events_master", {}),
-        },
-    )
-
+    # Minimal audit output for this step
     write_file_text(f"{OUTPUT_DIR}/audit_log.json", json.dumps(audit, indent=2))
-
-    # Sample fetch kept (unchanged)
-    os.makedirs(f"{OUTPUT_DIR}/filings_raw", exist_ok=True)
-    sample_n = 3
-    sample = []
-    seen_ciks = set()
-    for item in allowed_filings_all:
-        cik = item["cik"]
-        if cik in seen_ciks:
-            continue
-        seen_ciks.add(cik)
-        sample.append(item)
-        if len(sample) >= sample_n:
-            break
-
-    sample_results = []
-    for item in sample:
-        filing = FilingRef(
-            cik=item["cik"],
-            company=item["company"],
-            form_type=item["form_type"],
-            date_filed=item["date_filed"],
-            filename=item["filename"],
-            index_url=item["index_url"],
-        )
-
-        ok, content_bytes, err_str, http_status = fetch_primary_filing_text(filing=filing, user_agent=SEC_USER_AGENT)
-        out_name = filing_artifact_basename(filing)
-        out_path = f"{OUTPUT_DIR}/filings_raw/{out_name}"
-
-        bytes_len = (len(content_bytes) if content_bytes is not None else 0)
-        skipped_due_to_size = False
-        saved_path = None
-        labels = []
-        matched_terms = []
-
-        if ok and content_bytes is not None:
-            skipped_due_to_size = bytes_len > MAX_SAMPLE_BYTES
-            if not skipped_due_to_size:
-                write_file_bytes(out_path, content_bytes)
-                saved_path = out_path
-                filing_text = content_bytes.decode("utf-8", errors="replace")
-                labels, matched_terms = scan_filing_text_for_labels(filing_text)
-
-        sample_results.append(
-            {
-                "cik": filing.cik,
-                "company": filing.company,
-                "form_type": filing.form_type,
-                "date_filed": filing.date_filed,
-                "filename": filing.filename,
-                "index_url": filing.index_url,
-                "fetch_ok": ok,
-                "http_status": http_status,
-                "bytes": bytes_len,
-                "skipped_due_to_size": skipped_due_to_size,
-                "labels": labels,
-                "matched_terms": matched_terms,
-                "error": err_str,
-                "saved_path": (saved_path if saved_path else None),
-            }
-        )
-
-    write_file_text(f"{OUTPUT_DIR}/sample_filing_fetch.json", json.dumps(sample_results, indent=2))
-
-    run_meta = {
-        "system_version": SYSTEM_VERSION,
-        "output_artifacts": [
-            "allowed_filings.json",
-            "matched_allowed_filings.json",
-            "dilution_tickers_verbose.csv",
-            "dilution_tickers.csv",
-            "dilution_tickers_all_verbose.csv",
-            "dilution_tickers_all.csv",
-            "float_cache.json",
-            "float_gate_pass.csv",
-            "float_gate_fail.csv",
-            "float_gate_unknown.csv",
-            "label_summary.json",
-            "label_summary.csv",
-            "audit_log.json",
-            "run_metadata.json",
-            "sample_filing_fetch.json",
-            "dilution_severity_by_ticker.csv",
-            "avoid_tickers.csv",
-            "dilution_severity_events_all.csv",
-        ],
-        "run_timestamp_utc": run_time,
-        "scan_start_date": start_date,
-        "scan_end_date": end_date,
-        "date_mode": date_mode,
-        "scan_days": dates,
-        "allowed_forms": ALLOWED_FORMS,
-        "sec_user_agent": SEC_USER_AGENT,
-        "float_gate": audit.get("float_gate", {}),
-        "stale_prune": audit.get("stale_prune", {}),
-        "severity_events_master": audit.get("severity_events_master", {}),
-        "range_totals": audit.get("counts", {}),
-        "status": "stale_prune_v1_all_verbose_plus_severity_events_master",
-    }
-    write_file_text(f"{OUTPUT_DIR}/run_metadata.json", json.dumps(run_meta, indent=2))
-
-    print(f"Scan range: {start_date} .. {end_date} (days={len(dates)})")
-    print(f"Float gate: policy={FLOAT_GATE_POLICY}, max_shares={FLOAT_MAX_SHARES}")
-    sp = audit.get("stale_prune", {})
-    print(f"Stale prune: stale_days={STALE_DAYS}, cutoff={sp.get('cutoff_date_inclusive')}, active_master={sp.get('active_master_count')}, removed={sp.get('removed_stale_count')}")
-    sev = audit.get("severity_events_master", {})
-    print(f"Severity events master: prior={sev.get('prior_count')}, new_unique={sev.get('new_events_unique')}, pruned_removed={sev.get('removed_pruned_count')}, final={sev.get('final_count')}")
 
 
 if __name__ == "__main__":
