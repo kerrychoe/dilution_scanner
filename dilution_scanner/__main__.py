@@ -802,20 +802,20 @@ def build_dilution_severity_by_ticker(matched_allowed_all: list[dict], end_date_
 def write_avoid_tickers_csv_from_severity():
     sev_path = f"{OUTPUT_DIR}/dilution_severity_by_ticker.csv"
     if not os.path.exists(sev_path):
-        write_file_text(AVOID_TICKERS_OUT, "ticker\n")
+        write_file_text(AVOID_TICKERS_OUT, "")
         return
 
     with open(sev_path, "r", encoding="utf-8") as f:
         lines = f.read().splitlines()
 
     if not lines:
-        write_file_text(AVOID_TICKERS_OUT, "ticker\n")
+        write_file_text(AVOID_TICKERS_OUT, "")
         return
 
     header = lines[0].split(",")
     idx = {name: i for i, name in enumerate(header)}
     if "ticker" not in idx or "avoid_flag" not in idx:
-        write_file_text(AVOID_TICKERS_OUT, "ticker\n")
+        write_file_text(AVOID_TICKERS_OUT, "")
         return
 
     tickers = set()
@@ -830,7 +830,7 @@ def write_avoid_tickers_csv_from_severity():
         if tkr and af == "1":
             tickers.add(tkr)
 
-    out = ["ticker\n"]
+    out = []
     for t in sorted(tickers):
         out.append(f"{csv_escape(t)}\n")
     write_file_text(AVOID_TICKERS_OUT, "".join(out))
