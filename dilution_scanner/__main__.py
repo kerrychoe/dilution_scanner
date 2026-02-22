@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import csv
 import requests
 
 from datetime import datetime, timedelta, timezone, date
@@ -63,6 +64,9 @@ ALL_VERBOSE_COLUMNS = [
     "last_labels",
     "last_filing_url",
 ]
+
+# v1.1.1 additive derived output
+AVOID_TICKERS_CSV = f"{OUTPUT_DIR}/avoid_tickers.csv"
 
 
 def ensure_output_dir():
@@ -841,6 +845,45 @@ def build_dilution_severity_by_ticker(matched_allowed_all: list[dict], end_date_
     _write_severity_csv(f"{OUTPUT_DIR}/dilution_severity_by_ticker.csv", out_rows)
 
 
+# -----------------------------
+# v1.1.1 additive — AVOID TICKERS EXPORT
+# -----------------------------
+def write_avoid_tickers_csv():
+    """
+    Deterministically derive output/avoid_tickers.csv from output/dilution_severity_by_ticker.csv.
+
+    Schema:
+      ticker
+
+    Rule:
+      include ticker where avoid_flag == 1
+
+    Ordering:
+      ticker asc (deterministic)
+    """
+    severity_path = f"{OUTPUT_DIR}/dilution_severity_by_ticker.csv"
+    if not os.path.exists(severity_path):
+        return
+
+    avoid = []
+
+    with open(severity_path, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if row.get("avoid_flag") == "1":
+                t = (row.get("ticker") or "").strip().upper()
+                if t:
+                    avoid.append(t)
+
+    avoid = sorted(set(avoid))
+
+    with open(AVOID_TICKERS_CSV, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["ticker"])
+        for t in avoid:
+            w.writerow([t])
+
+
 def main():
     ensure_output_dir()
 
@@ -1276,6 +1319,9 @@ def main():
     # v1.1.x additive: write severity output
     build_dilution_severity_by_ticker(matched_allowed_all=matched_allowed_all, end_date_iso=end_date)
 
+    # v1.1.1 additive: write avoid tickers output (derived from severity output)
+    write_avoid_tickers_csv()
+
     verbose_header = ",".join(VERBOSE_COLUMNS) + "\n"
     write_file_text(f"{OUTPUT_DIR}/dilution_tickers_verbose.csv", verbose_header + "".join(verbose_rows_all))
 
@@ -1547,6 +1593,7 @@ def main():
             "run_metadata.json",
             "sample_filing_fetch.json",
             "dilution_severity_by_ticker.csv",
+            "avoid_tickers.csv",
         ],
         "run_timestamp_utc": run_time,
         "scan_start_date": start_date,
