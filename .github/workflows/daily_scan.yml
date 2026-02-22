@@ -56,6 +56,14 @@ jobs:
         run: |
           set -e
 
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # 1) Sync to latest main BEFORE making local changes
+          git fetch origin main
+          git rebase origin/main
+
+          # 2) Now apply generated outputs into repo root
           # ticker-only master (pruned)
           if [ -f output/dilution_tickers_all.csv ]; then
             cp output/dilution_tickers_all.csv dilution_tickers_all.csv
@@ -71,13 +79,7 @@ jobs:
             cp output/dilution_severity_events_all.csv dilution_severity_events_all.csv
           fi
 
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          # NEW: integrate any commits that happened while this workflow was running
-          git fetch origin main
-          git rebase origin/main
-          
+          # 3) Commit/push if changed
           git add dilution_tickers_all.csv dilution_tickers_all_verbose.csv dilution_severity_events_all.csv
 
           git diff --cached --quiet && echo "No changes to commit." && exit 0
