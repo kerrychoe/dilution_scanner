@@ -1301,6 +1301,59 @@ def main():
     write_file_text(f"{OUTPUT_DIR}/dilution_tickers_verbose.csv", verbose_header + "".join(verbose_rows_all))
     write_ticker_list(f"{OUTPUT_DIR}/dilution_tickers.csv", run_tickers_all)
 
+    # Bootstrap / update persistent _all files so clean rebuilds recreate repo-root masters.
+    existing_all = set()
+
+    if os.path.exists(ALL_TICKERS_ROOT):
+        with open(ALL_TICKERS_ROOT, "r", encoding="utf-8") as f:
+            for line in f:
+                t = line.strip().upper()
+                if t:
+                    existing_all.add(t)
+
+    current_run_set = set([t.strip().upper() for t in run_tickers_all if t and t.strip()])
+    merged_all = sorted(existing_all.union(current_run_set))
+
+    write_file_text(ALL_TICKERS_OUT, "\n".join(merged_all) + ("\n" if merged_all else ""))
+    write_file_text(ALL_TICKERS_ROOT, "\n".join(merged_all) + ("\n" if merged_all else ""))
+
+    prior_verbose = _parse_all_verbose_csv(ALL_VERBOSE_ROOT)
+    today = end_date  # use run end date so historical backfills stay historically correct
+
+    for line in verbose_rows_all:
+        parts = _split_csv_line(line.strip())
+        if len(parts) < len(VERBOSE_COLUMNS):
+            continue
+
+        ticker = parts[VERBOSE_COLUMNS.index("ticker")].strip().upper()
+        labels = parts[VERBOSE_COLUMNS.index("labels")] if "labels" in VERBOSE_COLUMNS else ""
+        filing_url = parts[VERBOSE_COLUMNS.index("filing_url")] if "filing_url" in VERBOSE_COLUMNS else ""
+
+        if not ticker:
+            continue
+
+        if ticker in prior_verbose:
+            rec = prior_verbose[ticker]
+            rec["last_seen_date"] = today
+            try:
+                rec["seen_count"] = str(int(rec.get("seen_count", "0")) + 1)
+            except Exception:
+                rec["seen_count"] = "1"
+            rec["last_labels"] = labels
+            rec["last_filing_url"] = filing_url
+        else:
+            prior_verbose[ticker] = {
+                "ticker": ticker,
+                "first_seen_date": today,
+                "last_seen_date": today,
+                "seen_count": "1",
+                "last_labels": labels,
+                "last_filing_url": filing_url,
+            }
+
+    _write_all_verbose_csv(ALL_VERBOSE_OUT, prior_verbose)
+    _write_all_verbose_csv(ALL_VERBOSE_ROOT, prior_verbose)
+
     # Minimal audit output for this step
     write_file_text(f"{OUTPUT_DIR}/audit_log.json", json.dumps(audit, indent=2))
 
