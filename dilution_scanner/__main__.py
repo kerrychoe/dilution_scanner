@@ -89,13 +89,17 @@ def ensure_output_dir():
 
 
 def write_file_bytes(path, content_bytes: bytes):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    dirpath = os.path.dirname(path)
+    if dirpath:
+        os.makedirs(dirpath, exist_ok=True)
     with open(path, "wb") as f:
         f.write(content_bytes)
 
 
 def write_file_text(path, content_text: str):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    dirpath = os.path.dirname(path)
+    if dirpath:
+        os.makedirs(dirpath, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         f.write(content_text)
 
