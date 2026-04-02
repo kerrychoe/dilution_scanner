@@ -59,30 +59,46 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # 1) Sync to latest main BEFORE making local changes
-          git fetch origin main
-          git rebase origin/main
-
-          # 2) Now apply generated outputs into repo root
-          # ticker-only master (pruned)
+          # 1) Copy generated outputs into repo root
           if [ -f output/dilution_tickers_all.csv ]; then
             cp output/dilution_tickers_all.csv dilution_tickers_all.csv
           fi
 
-          # verbose master (pruned + stateful)
           if [ -f output/dilution_tickers_all_verbose.csv ]; then
             cp output/dilution_tickers_all_verbose.csv dilution_tickers_all_verbose.csv
           fi
 
-          # severity events master (pruned + stateful) — v1.1.2
           if [ -f output/dilution_severity_events_all.csv ]; then
             cp output/dilution_severity_events_all.csv dilution_severity_events_all.csv
           fi
 
-          # 3) Commit/push if changed
-          git add dilution_tickers_all.csv dilution_tickers_all_verbose.csv dilution_severity_events_all.csv
+          # 2) Stage only files that actually exist
+          FOUND=0
 
+          if [ -f dilution_tickers_all.csv ]; then
+            git add dilution_tickers_all.csv
+            FOUND=1
+          fi
+
+          if [ -f dilution_tickers_all_verbose.csv ]; then
+            git add dilution_tickers_all_verbose.csv
+            FOUND=1
+          fi
+
+          if [ -f dilution_severity_events_all.csv ]; then
+            git add dilution_severity_events_all.csv
+            FOUND=1
+          fi
+
+          if [ "$FOUND" -eq 0 ]; then
+            echo "No persistent files found to commit."
+            exit 0
+          fi
+
+          # 3) Exit cleanly if nothing changed
           git diff --cached --quiet && echo "No changes to commit." && exit 0
 
+          # 4) Commit first, then rebase, then push
           git commit -m "Update dilution tickers + severity events masters (pruned)"
-          git push
+          git pull --rebase origin main
+          git push origin HEAD:main
